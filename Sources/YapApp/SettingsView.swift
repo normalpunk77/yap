@@ -167,6 +167,10 @@ struct SettingsView: View {
                 }
                 .onChange(of: selectedDeviceUID) { _, uid in
                     AppConfig.preferredInputDeviceUID = uid.isEmpty ? nil : uid
+                    // The Parakeet daemon pins its mic at launch via --device, so a running
+                    // daemon would keep using the old one. Stop it; the next dictation restarts
+                    // it on the newly chosen device.
+                    ParakeetManager.shared.stopDaemon()
                 }
                 Text("Built-in is the default: recording through AirPods would drop their music into call mode.")
                     .font(.caption)
@@ -185,6 +189,9 @@ struct SettingsView: View {
                     AppConfig.provider = newValue
                     apiKey = APIKeyStore.loadAPIKey(for: newValue) ?? ""
                     status = ""
+                    // Switching away from Parakeet: shut its daemon down instead of leaving it
+                    // running in the background holding the model in RAM.
+                    if !newValue.isLocal { ParakeetManager.shared.stopDaemon() }
                 }
 
                 if provider.isLocal {
