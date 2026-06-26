@@ -22,6 +22,9 @@ final class ParakeetManager: ObservableObject {
 
     private var daemon: Process?
     private var socketURL: URL { support.appendingPathComponent("parakeet.sock") }
+    /// Where the daemon's stdout/stderr go, so a failed start (mic denied, model error) is
+    /// diagnosable instead of vanishing into /dev/null. Truncated each time the daemon starts.
+    var daemonLogURL: URL { support.appendingPathComponent("parakeet-daemon.log") }
 
     private let fm = FileManager.default
     private var support: URL {
@@ -73,8 +76,17 @@ final class ParakeetManager: ObservableObject {
                              "--model-dir", modelDir.path,
                              "--socket", socketURL.path,
                              "--clipboard"]
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
+        // Send the daemon's output to a log file (not /dev/null) so a failed start is
+        // diagnosable. Fall back to discarding if the file can't be created.
+        try? fm.createDirectory(at: support, withIntermediateDirectories: true)
+        fm.createFile(atPath: daemonLogURL.path, contents: nil)
+        if let logHandle = try? FileHandle(forWritingTo: daemonLogURL) {
+            process.standardOutput = logHandle
+            process.standardError = logHandle
+        } else {
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = FileHandle.nullDevice
+        }
         try process.run()
         daemon = process
         // Wait (≤10 s) for the daemon to load the model and create its socket.

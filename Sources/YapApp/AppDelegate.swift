@@ -20,8 +20,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private var didPromptForKey = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // Keys now live in the Keychain; wipe any plaintext keys older builds left in
-        // UserDefaults so nothing sensitive lingers in a readable plist.
+        // Recover keys saved under the pre-rename bundle id so they don't appear lost after
+        // upgrading, then wipe any plaintext keys older builds left in UserDefaults so nothing
+        // sensitive lingers in a readable plist.
+        APIKeyStore.migrateLegacyKeychainKeys()
         APIKeyStore.purgeLegacyPlaintextKeys()
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -105,8 +107,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         hotKey = HotKeyManager(onTrigger: { [weak self] in
             Task { @MainActor in
                 guard let self else { return }
-                // Local engine (Parakeet) owns its own mic via the daemon — route there.
+                // Local engine (Parakeet) records via its daemon — a child process whose mic
+                // access is attributed to Yap. So Yap itself must hold Microphone permission
+                // before we start, or the daemon captures silence (and CoreAudio beeps). Only
+                // gate on start; stopping needs no mic.
                 if AppConfig.provider.isLocal {
+                    if !self.parakeetController.isRecording {
+                        guard await self.ensureMicrophoneAuthorized() else { return }
+                    }
                     await self.parakeetController.toggle()
                     return
                 }
@@ -395,6 +403,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             return false
         default:
             return true
+        }
+    }
+
+    /// Like `ensureMicrophoneAccess`, but resolves `.notDetermined` by actively requesting
+    /// access so the grant is recorded for `com.yap`. The Parakeet path needs this because the
+    /// daemon (a child process) can't surface the first-run prompt itself — Yap must own the
+    /// grant up front, then the daemon inherits it.
+    private func ensureMicrophoneAuthorized() async -> Bool {
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized:
+            return true
+        case .denied, .restricted:
+            promptForMicrophone()
+            return false
+        case .notDetermined:
+            return await AVCaptureDevice.requestAccess(for: .audio)
+        @unknown default:
+            return false
         }
     }
 

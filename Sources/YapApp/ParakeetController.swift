@@ -10,6 +10,10 @@ final class ParakeetController {
     private let manager = ParakeetManager.shared
     private var recording = false
 
+    /// Whether a recording session is currently active (so the hotkey path can skip the
+    /// microphone gate when the press is a stop, not a start).
+    var isRecording: Bool { recording }
+
     /// Recording started/stopped — drives the aura.
     var onRecording: ((Bool) -> Void)?
     /// A user-facing error (engine not set up, daemon failed to start).

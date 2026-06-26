@@ -50,6 +50,49 @@ enum APIKeyStore {
         return value
     }
 
+    /// Bundle ids the app shipped under before settling on `com.yap`. Their Keychain items use
+    /// the same per-provider suffix and `api-key` account, just a different service prefix.
+    private static let legacyServicePrefixes = ["io.github.normalpunk77.yap"]
+
+    private static func legacyService(prefix: String, for provider: TranscriptionProvider) -> String? {
+        switch provider {
+        case .elevenLabs:    return "\(prefix).elevenlabs-api-key"
+        case .deepgram:      return "\(prefix).deepgram-api-key"
+        case .parakeetLocal: return nil   // local: no key was ever stored
+        }
+    }
+
+    /// One-time migration: the bundle id rename (`io.github.normalpunk77.yap` → `com.yap`)
+    /// changed the Keychain service prefix, so a key the user saved under the old name would
+    /// silently vanish from the UI after upgrading. Copy any old-name key to the new service
+    /// (only when the new slot is empty) and delete the orphan, so existing users keep their key.
+    static func migrateLegacyKeychainKeys() {
+        for provider in [TranscriptionProvider.elevenLabs, .deepgram] {
+            if loadAPIKey(for: provider) != nil { continue }   // already present under com.yap
+            for prefix in legacyServicePrefixes {
+                guard let old = legacyService(prefix: prefix, for: provider) else { continue }
+                let query: [String: Any] = [
+                    kSecClass as String: kSecClassGenericPassword,
+                    kSecAttrService as String: old,
+                    kSecAttrAccount as String: account,
+                    kSecReturnData as String: true,
+                    kSecMatchLimit as String: kSecMatchLimitOne,
+                ]
+                var item: CFTypeRef?
+                guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
+                      let data = item as? Data,
+                      let value = String(data: data, encoding: .utf8), !value.isEmpty else { continue }
+                saveAPIKey(value, for: provider)   // writes under the new com.yap service
+                SecItemDelete([
+                    kSecClass as String: kSecClassGenericPassword,
+                    kSecAttrService as String: old,
+                    kSecAttrAccount as String: account,
+                ] as CFDictionary)
+                break
+            }
+        }
+    }
+
     /// One-time hygiene: wipe any plaintext API keys left in UserDefaults by older builds (the
     /// keys now live in the Keychain), in both the current and legacy `com.dictabar` domains,
     /// so no plaintext key lingers on disk.
