@@ -100,13 +100,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
                     Task { @MainActor [weak self] in self?.render(state) }
                 },
                 onResult: { text in
-                    Task { @MainActor in Paster.pasteAtCursor(text) }
+                    Task { @MainActor [weak self] in self?.deliver(text: text) }
                 }
             )
         }
 
         parakeetController.onRecording = { [weak self] on in self?.renderParakeet(recording: on) }
         parakeetController.onError = { [weak self] msg in self?.presentError(msg) }
+        parakeetController.onText = { [weak self] text in self?.deliver(text: text) }
 
         hotKey = HotKeyManager(onTrigger: { [weak self] in
             Task { @MainActor in
@@ -152,6 +153,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         if !UserDefaults.standard.bool(forKey: "didOnboard") {
             UserDefaults.standard.set(true, forKey: "didOnboard")
             openSettings()
+        }
+    }
+
+    /// THE single delivery path for every engine: run the optional AI cleanup (which always
+    /// falls back to the raw transcript on any failure), then paste at the cursor.
+    private func deliver(text: String) {
+        Task { @MainActor in
+            let processor = self.makePostProcessor()
+            let finalText = await PostProcessRunner.run(text, with: processor)
+            Paster.pasteAtCursor(finalText)
+        }
+    }
+
+    /// Build a Gemini post-processor from current settings + stored credentials, or nil when
+    /// disabled or unconfigured (→ raw paste). Reads fresh each call so Settings changes apply
+    /// to the next dictation without a restart.
+    private func makePostProcessor() -> TextPostProcessor? {
+        let s = AppConfig.postProcessSettings()
+        guard s.enabled else { return nil }
+        switch s.authMethod {
+        case .apiKey:
+            guard let key = LLMCredentialStore.loadGeminiAPIKey(), !key.isEmpty else { return nil }
+            return GeminiPostProcessor(model: s.model, prompt: s.prompt, auth: .apiKey(key))
+        case .vertex:
+            guard
+                let json = LLMCredentialStore.loadVertexServiceAccountJSON(),
+                let account = ServiceAccount(json: json),
+                !s.vertexProject.isEmpty
+            else { return nil }
+            let auth = GoogleServiceAccountAuth(account: account)
+            let region = s.vertexRegion.isEmpty ? PostProcessDefaults.vertexRegion : s.vertexRegion
+            return GeminiPostProcessor(
+                model: s.model, prompt: s.prompt,
+                auth: .vertex(token: { try await auth.accessToken() },
+                              project: s.vertexProject, region: region)
+            )
         }
     }
 

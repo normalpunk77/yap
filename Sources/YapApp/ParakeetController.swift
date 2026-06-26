@@ -18,6 +18,9 @@ final class ParakeetController {
     var onRecording: ((Bool) -> Void)?
     /// A user-facing error (engine not set up, daemon failed to start).
     var onError: ((String) -> Void)?
+    /// The finished transcript, for the owner to post-process + paste. Replaces the old direct
+    /// paste so the local engine shares the cloud delivery path.
+    var onText: ((String) -> Void)?
 
     func toggle() async {
         recording ? await stop() : await start()
@@ -59,7 +62,7 @@ final class ParakeetController {
             try? await Task.sleep(nanoseconds: 50_000_000)   // 50 ms × 120 ≈ 6 s
             if NSPasteboard.general.changeCount != clipboardBefore {
                 let text = NSPasteboard.general.string(forType: .string) ?? ""
-                if !text.isEmpty { Paster.pasteAtCursor(text) }
+                if !text.isEmpty { onText?(text) }
                 return
             }
         }
