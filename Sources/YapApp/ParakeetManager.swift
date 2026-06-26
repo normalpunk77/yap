@@ -85,11 +85,19 @@ final class ParakeetManager: ObservableObject {
         try? fm.removeItem(at: socketURL)
         let process = Process()
         process.executableURL = URL(fileURLWithPath: bin)
-        process.arguments = ["serve",
-                             "--model-dir", modelDir.path,
-                             "--socket", socketURL.path,
-                             "--pid-file", pidURL.path,
-                             "--clipboard"]
+        var arguments = ["serve",
+                         "--model-dir", modelDir.path,
+                         "--socket", socketURL.path,
+                         "--pid-file", pidURL.path,
+                         "--clipboard"]
+        // Pin the daemon to the user's chosen input (built-in mic by default), exactly like
+        // MicrophoneCapture does. Otherwise the daemon grabs the system DEFAULT input — the
+        // AirPods when they're connected — which forces them out of music (A2DP) into call
+        // mode (HFP), interrupting whatever the user is listening to. cpal matches by name.
+        if let deviceName = preferredInputDeviceName() {
+            arguments += ["--device", deviceName]
+        }
+        process.arguments = arguments
         // A GUI app launched by launchd inherits NO locale, so the daemon's `pbcopy` would read
         // the transcript's UTF-8 bytes as MacRoman and mangle every accent (è → √®). Force a
         // UTF-8 locale on the daemon (and the pbcopy it spawns) so accented text survives.
@@ -120,6 +128,17 @@ final class ParakeetManager: ObservableObject {
             try await Task.sleep(nanoseconds: 50_000_000)
         }
         throw ParakeetError.daemonDidNotStart
+    }
+
+    /// The input device name to pin the daemon to, matching the user's mic choice (built-in by
+    /// default). Returns nil only when neither the chosen device nor a built-in mic resolves, in
+    /// which case the daemon falls back to the system default.
+    private func preferredInputDeviceName() -> String? {
+        if let uid = AppConfig.preferredInputDeviceUID,
+           let chosen = AudioInputDevices.all().first(where: { $0.uid == uid }) {
+            return chosen.name
+        }
+        return AudioInputDevices.builtIn()?.name
     }
 
     /// Terminate a daemon left running by a previous session and remove its pid file (both the
