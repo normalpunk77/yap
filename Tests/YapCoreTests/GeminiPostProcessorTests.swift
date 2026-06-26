@@ -49,4 +49,38 @@ final class GeminiPostProcessorTests: XCTestCase {
             XCTAssertEqual(error as? GeminiWireError, .noCandidateText)
         }
     }
+
+    func testVertexPathHitsRegionalURLWithBearer() async throws {
+        var seenURL: URL?
+        var seenAuth: String?
+        MockURLProtocol.handler = { req in
+            seenURL = req.url
+            seenAuth = req.value(forHTTPHeaderField: "Authorization")
+            let body = #"{"candidates":[{"content":{"parts":[{"text":"Ciao."}]}}]}"#.data(using: .utf8)!
+            return (200, body)
+        }
+        let proc = GeminiPostProcessor(
+            model: .flash,
+            prompt: "SYS",
+            auth: .vertex(token: { "TOK" }, project: "my-proj", region: "europe-west1"),
+            session: MockURLProtocol.session()
+        )
+        let out = try await proc.process("ciao")
+        XCTAssertEqual(out, "Ciao.")
+        XCTAssertEqual(seenURL?.absoluteString,
+            "https://europe-west1-aiplatform.googleapis.com/v1/projects/my-proj/locations/europe-west1/publishers/google/models/gemini-2.5-flash:generateContent")
+        XCTAssertEqual(seenAuth, "Bearer TOK")
+    }
+
+    func testVertexTokenFailurePropagates() async {
+        struct Boom: Error {}
+        MockURLProtocol.handler = { _ in (200, Data(#"{"candidates":[]}"#.utf8)) }
+        let proc = GeminiPostProcessor(
+            model: .flash, prompt: "S",
+            auth: .vertex(token: { throw Boom() }, project: "p", region: "us-central1"),
+            session: MockURLProtocol.session()
+        )
+        do { _ = try await proc.process("x"); XCTFail("expected throw") }
+        catch { XCTAssertTrue(error is Boom) }
+    }
 }
