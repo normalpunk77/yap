@@ -127,6 +127,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         // Let Settings (re)bind the shortcut and learn whether it took.
         HotKeyBridge.apply = { [weak self] shortcut in self?.applyHotKey(shortcut) ?? false }
 
+        // Register for Accessibility on launch so Yap shows up in System Settings →
+        // Privacy → Accessibility (un-toggled) the moment it's installed — the user can
+        // enable it without first having to attempt a dictation. When already trusted this
+        // is a silent no-op; the system dialog only appears the first time, when there is
+        // no TCC entry yet. A one-shot call: no timer, no impact on idle CPU.
+        Paster.promptForAccessibility()
+
         // A Dock-less accessory app is easy to "lose" — there's no window or Dock icon,
         // only the menu-bar glyph. Open Settings once, on the very first launch, so the
         // user can find and configure it. Afterwards it's reachable from the menu only.

@@ -73,6 +73,8 @@ launch Settings opens automatically so you can configure it.
 
 1. **Settings → Speech-to-text:** pick a provider, paste your API key, click *Save & Verify*.
 2. **Permissions:** grant **Microphone** (to hear you) and **Accessibility** (to paste).
+   Yap adds itself to *System Settings → Privacy & Security → Accessibility* on first
+   launch — just flip its switch on (no need to add it with `+`).
 3. Put your cursor in any text field, press your dictation hotkey, speak, and press it again.
 
 ## How it works
