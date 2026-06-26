@@ -87,6 +87,16 @@ struct SettingsView: View {
     @State private var hotKey: HotKeyShortcut = AppConfig.hotKey
     @State private var hotKeyStatus: String = ""
 
+    // AI post-processing (Gemini)
+    @State private var ppEnabled: Bool = AppConfig.postProcessEnabled
+    @State private var ppAuth: GeminiAuthMethod = AppConfig.geminiAuthMethod
+    @State private var ppModel: GeminiModel = AppConfig.postProcessModel
+    @State private var ppPrompt: String = AppConfig.postProcessPrompt
+    @State private var geminiKey: String = LLMCredentialStore.loadGeminiAPIKey() ?? ""
+    @State private var vertexProject: String = AppConfig.vertexProject
+    @State private var vertexRegion: String = AppConfig.vertexRegion
+    @State private var ppStatus: String = ""
+
     // Local engine (Parakeet) setup state
     @ObservedObject private var parakeet = ParakeetManager.shared
 
@@ -235,6 +245,62 @@ struct SettingsView: View {
                     .overlay(RoundedRectangle(cornerRadius: 6).stroke(.secondary.opacity(0.3)))
             }
 
+            Section("AI cleanup") {
+                Toggle("Clean up transcript with AI (Gemini)", isOn: $ppEnabled)
+                    .onChange(of: ppEnabled) { _, v in AppConfig.postProcessEnabled = v }
+                Text("Runs after every engine (including on-device Parakeet). On any error the raw transcript is pasted, so dictation is never lost.")
+                    .font(.caption).foregroundStyle(.secondary)
+
+                if ppEnabled {
+                    Picker("Auth", selection: $ppAuth) {
+                        Text("API key (AI Studio)").tag(GeminiAuthMethod.apiKey)
+                        Text("Vertex (service account)").tag(GeminiAuthMethod.vertex)
+                    }
+                    .pickerStyle(.segmented)
+                    .onChange(of: ppAuth) { _, v in AppConfig.geminiAuthMethod = v; ppStatus = "" }
+
+                    if ppAuth == .apiKey {
+                        SecureField("Gemini API key", text: $geminiKey)
+                            .textFieldStyle(.roundedBorder)
+                    } else {
+                        Button("Choose service-account JSON…") { pickServiceAccountJSON() }
+                        if !vertexProject.isEmpty {
+                            LabeledContent("Project", value: vertexProject)
+                            HStack {
+                                Text("Region")
+                                TextField("us-central1", text: $vertexRegion)
+                                    .textFieldStyle(.roundedBorder)
+                                    .onSubmit { AppConfig.vertexRegion = vertexRegion }
+                            }
+                        }
+                    }
+
+                    Picker("Model", selection: $ppModel) {
+                        ForEach(GeminiModel.allCases, id: \.self) { m in
+                            Text(m.displayName).tag(m)
+                        }
+                    }
+                    .onChange(of: ppModel) { _, v in AppConfig.postProcessModel = v }
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Prompt").font(.caption).foregroundStyle(.secondary)
+                        TextEditor(text: $ppPrompt)
+                            .font(.system(size: 12, design: .monospaced))
+                            .frame(height: 110)
+                            .overlay(RoundedRectangle(cornerRadius: 6).stroke(.secondary.opacity(0.3)))
+                        HStack {
+                            Button("Reset to default") { ppPrompt = PostProcessDefaults.prompt; AppConfig.postProcessPrompt = ppPrompt }
+                            Spacer()
+                        }
+                    }
+
+                    HStack(spacing: 10) {
+                        Button("Save & Verify") { saveAndVerifyGemini() }
+                        Text(ppStatus).font(.callout).foregroundStyle(.secondary)
+                    }
+                }
+            }
+
             Section {
                 Text("Hotkey: ⌥S (Option+S) to start / stop dictation.")
                     .font(.caption)
@@ -339,6 +405,40 @@ struct SettingsView: View {
         }
     }
 
+    private func pickServiceAccountJSON() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.json]
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        guard panel.runModal() == .OK, let url = panel.url,
+              let text = try? String(contentsOf: url, encoding: .utf8) else { return }
+        guard let account = ServiceAccount(json: text) else {
+            ppStatus = "✗ Not a service-account JSON (missing project_id/client_email)"
+            return
+        }
+        LLMCredentialStore.saveVertexServiceAccountJSON(text)
+        vertexProject = account.projectID
+        AppConfig.vertexProject = account.projectID
+        ppStatus = "✓ Service account loaded — project \(account.projectID)"
+    }
+
+    private func saveAndVerifyGemini() {
+        AppConfig.postProcessEnabled = ppEnabled
+        AppConfig.geminiAuthMethod = ppAuth
+        AppConfig.postProcessModel = ppModel
+        AppConfig.postProcessPrompt = ppPrompt
+        AppConfig.vertexProject = vertexProject
+        AppConfig.vertexRegion = vertexRegion
+        if ppAuth == .apiKey { LLMCredentialStore.saveGeminiAPIKey(geminiKey) }
+        ppStatus = "Verifying…"
+        let settings = AppConfig.postProcessSettings()
+        let key = geminiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        Task {
+            let result = await GeminiKeyCheck.check(settings: settings, apiKey: key)
+            await MainActor.run { ppStatus = result }
+        }
+    }
+
     private func saveAndVerify() {
         let key = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
         AppConfig.provider = provider
@@ -366,6 +466,40 @@ private struct MicChoice: Identifiable, Hashable {
     let uid: String
     let label: String
     var id: String { uid }
+}
+
+enum GeminiKeyCheck {
+    /// Sends a tiny real request through the configured processor; a non-throwing round-trip
+    /// means the credential + endpoint work. Returns a short human-readable status.
+    static func check(settings: PostProcessSettings, apiKey: String) async -> String {
+        let processor: TextPostProcessor
+        switch settings.authMethod {
+        case .apiKey:
+            guard !apiKey.isEmpty else { return "✗ Empty key" }
+            processor = GeminiPostProcessor(model: settings.model, prompt: "Reply with: ok", auth: .apiKey(apiKey))
+        case .vertex:
+            guard let json = LLMCredentialStore.loadVertexServiceAccountJSON(),
+                  let account = ServiceAccount(json: json), !settings.vertexProject.isEmpty else {
+                return "✗ Pick a service-account JSON first"
+            }
+            let auth = GoogleServiceAccountAuth(account: account)
+            processor = GeminiPostProcessor(
+                model: settings.model, prompt: "Reply with: ok",
+                auth: .vertex(token: { try await auth.accessToken() },
+                              project: settings.vertexProject,
+                              region: settings.vertexRegion.isEmpty ? PostProcessDefaults.vertexRegion : settings.vertexRegion)
+            )
+        }
+        do {
+            _ = try await processor.process("ping")
+            return "✓ Working — saved"
+        } catch let e as GeminiPostProcessorError {
+            if case .httpStatus(let code) = e { return "✗ Rejected (HTTP \(code))" }
+            return "✗ Empty response"
+        } catch {
+            return "✗ \(Diag.describe(error))"
+        }
+    }
 }
 
 enum ElevenLabsKeyCheck {
