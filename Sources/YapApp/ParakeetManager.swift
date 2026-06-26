@@ -90,6 +90,13 @@ final class ParakeetManager: ObservableObject {
                              "--socket", socketURL.path,
                              "--pid-file", pidURL.path,
                              "--clipboard"]
+        // A GUI app launched by launchd inherits NO locale, so the daemon's `pbcopy` would read
+        // the transcript's UTF-8 bytes as MacRoman and mangle every accent (è → √®). Force a
+        // UTF-8 locale on the daemon (and the pbcopy it spawns) so accented text survives.
+        var env = ProcessInfo.processInfo.environment
+        env["LANG"] = "en_US.UTF-8"
+        env["LC_CTYPE"] = "en_US.UTF-8"
+        process.environment = env
         // Send the daemon's output to a log file (not /dev/null) so a failed start is
         // diagnosable. Fall back to discarding if the file can't be created.
         try? fm.createDirectory(at: support, withIntermediateDirectories: true)
