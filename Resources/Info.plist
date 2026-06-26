@@ -4,7 +4,7 @@
 <dict>
     <key>CFBundleName</key><string>Yap</string>
     <key>CFBundleDisplayName</key><string>Yap</string>
-    <key>CFBundleIdentifier</key><string>io.github.normalpunk77.yap</string>
+    <key>CFBundleIdentifier</key><string>com.yap</string>
     <key>CFBundleExecutable</key><string>Yap</string>
     <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>CFBundlePackageType</key><string>APPL</string>

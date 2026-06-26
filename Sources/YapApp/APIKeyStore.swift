@@ -13,9 +13,9 @@ import YapCore
 enum APIKeyStore {
     private static func service(for provider: TranscriptionProvider) -> String {
         switch provider {
-        case .elevenLabs:   return "io.github.normalpunk77.yap.elevenlabs-api-key"
-        case .deepgram:     return "io.github.normalpunk77.yap.deepgram-api-key"
-        case .parakeetLocal: return "io.github.normalpunk77.yap.parakeet"  // local: no key, never stored
+        case .elevenLabs:   return "com.yap.elevenlabs-api-key"
+        case .deepgram:     return "com.yap.deepgram-api-key"
+        case .parakeetLocal: return "com.yap.parakeet"  // local: no key, never stored
         }
     }
     private static let account = "api-key"

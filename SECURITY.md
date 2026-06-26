@@ -107,7 +107,7 @@ privacy contract live in [`Diagnostics.swift`](Sources/YapCore/Diagnostics.swift
 output yourself:
 
 ```bash
-log stream --predicate 'subsystem == "io.github.normalpunk77.yap"' --info
+log stream --predicate 'subsystem == "com.yap"' --info
 ```
 
 ## App Sandbox
