@@ -1,9 +1,14 @@
-.PHONY: test build run install clean
+.PHONY: test build run install signing-identity clean
 
 LSREGISTER = /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
 
 test:
 	swift test
+
+# Optional, run once: create a stable self-signed code-signing identity so the Keychain
+# keeps trusting the app across rebuilds (no repeated "allow access" prompts).
+signing-identity:
+	bash scripts/make-signing-identity.sh
 
 build:
 	bash scripts/build-app.sh debug
