@@ -156,7 +156,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         if recording {
             beginDictationActivity()
             updateIcon(recording: true)
-            edgeGlow.show()
+            // Parakeet's mic lives in the daemon, so no levels reach `micCapture` — show the
+            // aura in self-breathing mode instead of leaving it stuck at a dead baseline.
+            edgeGlow.show(voiceReactive: false)
         } else {
             endDictationActivity()
             updateIcon(recording: false)

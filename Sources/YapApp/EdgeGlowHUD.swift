@@ -16,6 +16,10 @@ enum AuraColors {
 final class EdgeGlowModel: ObservableObject {
     // @Published so flipping it mounts/unmounts the render loop (see EdgeGlowView).
     @Published var active = false
+    // When false, no real mic levels feed the glow (the Parakeet daemon owns the mic in a
+    // separate process), so the render loop breathes a synthetic level instead of sitting at
+    // a dead baseline. Cloud dictation leaves this true and stays voice-reactive.
+    var voiceReactive = true
     // `level` is the raw mic target; `displayedLevel` is the render-smoothed value we
     // actually draw. Plain vars (not @Published): the TimelineView drives the redraws,
     // and the per-frame easing reads/writes these without retriggering SwiftUI.
@@ -35,7 +39,8 @@ final class EdgeGlowHUD {
     private var panel: NSPanel?
     private let model = EdgeGlowModel()
 
-    func show() {
+    func show(voiceReactive: Bool = true) {
+        model.voiceReactive = voiceReactive
         // Idempotent: the dictation state (and thus this call) is re-emitted on every
         // partial transcript (~10×/s), but the panel is already up — bail out so we
         // don't re-order it to the front against the window server on every update.
@@ -139,6 +144,11 @@ struct EdgeGlowView: View {
         // staying reactive — the raw mic level is too coarse to draw directly.
         let dt = max(0, min(0.1, time - model.lastTick))
         model.lastTick = time
+        // No real mic levels (Parakeet records in its daemon) → breathe a gentle synthetic
+        // level so the aura clearly reads as "listening" instead of a flat baseline.
+        if !model.voiceReactive {
+            model.level = 0.45 + 0.35 * (0.5 + 0.5 * sin(time * 1.7))
+        }
         let tau = model.level > model.displayedLevel ? 0.045 : 0.16
         model.displayedLevel += (model.level - model.displayedLevel) * (1 - exp(-dt / tau))
         let level = CGFloat(min(max(model.displayedLevel, 0), 1))

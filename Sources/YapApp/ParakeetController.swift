@@ -30,15 +30,19 @@ final class ParakeetController {
             onError?("Parakeet isn't set up yet. Open Settings → Parakeet and let it finish building and downloading the model.")
             return
         }
+        // Show the aura immediately on the keypress — the first start blocks for seconds while
+        // the daemon loads the model, and a silent app reads as broken. Revert if it fails.
+        recording = true
+        onRecording?(true)
         do {
             try await manager.ensureDaemonRunning()
         } catch {
+            recording = false
+            onRecording?(false)
             onError?((error as? ParakeetError)?.message ?? "\(error)")
             return
         }
         manager.sendDaemonCommand("start")
-        recording = true
-        onRecording?(true)
     }
 
     private func stop() async {
