@@ -176,6 +176,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     /// transcription mic in another process; this independent tap exists only to give the aura
     /// the user's voice. Best-effort: on failure the aura keeps self-breathing.
     private func startParakeetMeter() {
+        // Don't open the meter mic while the user is listening on AirPods: a second input
+        // session knocks them out of music mode into call mode and interrupts their audio.
+        // The aura simply self-breathes instead (it was already shown that way).
+        guard !AudioInputDevices.defaultOutputIsBluetooth() else { return }
         parakeetMeter.onLevel = { [weak self] level in
             Task { @MainActor in
                 self?.edgeGlow.setVoiceReactive(true)

@@ -33,6 +33,23 @@ enum AudioInputDevices {
     /// The built-in microphone, if this Mac has one.
     static func builtIn() -> AudioInputDevice? { all().first { $0.isBuiltIn } }
 
+    /// True when the system's current default OUTPUT device is Bluetooth (e.g. AirPods).
+    /// Opening a mic while the user is listening on AirPods knocks them out of music mode
+    /// (A2DP) into call mode (HFP), interrupting their audio — so callers can skip an
+    /// otherwise-optional capture in that case.
+    static func defaultOutputIsBluetooth() -> Bool {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        var device = AudioDeviceID(0)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        guard AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &device) == noErr,
+              device != 0 else { return false }
+        return transportType(device) == kAudioDeviceTransportTypeBluetooth
+    }
+
     /// Resolve a persisted UID to a live device ID, or nil if that device is gone.
     static func deviceID(forUID uid: String) -> AudioDeviceID? {
         all().first { $0.uid == uid }?.id
