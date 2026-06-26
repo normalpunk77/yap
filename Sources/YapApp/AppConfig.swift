@@ -11,6 +11,12 @@ enum AppConfig {
     private static let hotKeyCodeKey = "hotkey_keycode"
     private static let hotKeyModsKey = "hotkey_modifiers"
     private static let hotKeyLabelKey = "hotkey_label"
+    private static let postProcEnabledKey = "postproc_enabled"
+    private static let postProcModelKey = "postproc_model"
+    private static let postProcPromptKey = "postproc_prompt"
+    private static let geminiAuthMethodKey = "gemini_auth_method"
+    private static let vertexProjectKey = "vertex_project"
+    private static let vertexRegionKey = "vertex_region"
 
     // MARK: Dictation hotkey
 
@@ -103,5 +109,52 @@ enum AppConfig {
     static var noVerbatim: Bool {
         get { UserDefaults.standard.object(forKey: noVerbatimKey) as? Bool ?? true }
         set { UserDefaults.standard.set(newValue, forKey: noVerbatimKey) }
+    }
+
+    // MARK: AI post-processing (Gemini)
+
+    /// Master switch for the AI cleanup pass. Ships OFF — it requires a credential and sends
+    /// the transcript to Gemini, so it must be an explicit opt-in.
+    static var postProcessEnabled: Bool {
+        get { UserDefaults.standard.bool(forKey: postProcEnabledKey) }
+        set { UserDefaults.standard.set(newValue, forKey: postProcEnabledKey) }
+    }
+
+    static var geminiAuthMethod: GeminiAuthMethod {
+        get { GeminiAuthMethod(rawValue: UserDefaults.standard.string(forKey: geminiAuthMethodKey) ?? "") ?? .apiKey }
+        set { UserDefaults.standard.set(newValue.rawValue, forKey: geminiAuthMethodKey) }
+    }
+
+    static var postProcessModel: GeminiModel {
+        get { GeminiModel(rawValue: UserDefaults.standard.string(forKey: postProcModelKey) ?? "") ?? .flashLite }
+        set { UserDefaults.standard.set(newValue.rawValue, forKey: postProcModelKey) }
+    }
+
+    /// Falls back to the curated default only when nothing was ever saved. A saved empty
+    /// string would be respected, but the UI prevents saving empty (Reset restores default).
+    static var postProcessPrompt: String {
+        get { UserDefaults.standard.string(forKey: postProcPromptKey) ?? PostProcessDefaults.prompt }
+        set { UserDefaults.standard.set(newValue, forKey: postProcPromptKey) }
+    }
+
+    static var vertexProject: String {
+        get { UserDefaults.standard.string(forKey: vertexProjectKey) ?? "" }
+        set { UserDefaults.standard.set(newValue, forKey: vertexProjectKey) }
+    }
+
+    static var vertexRegion: String {
+        get { UserDefaults.standard.string(forKey: vertexRegionKey) ?? PostProcessDefaults.vertexRegion }
+        set { UserDefaults.standard.set(newValue, forKey: vertexRegionKey) }
+    }
+
+    static func postProcessSettings() -> PostProcessSettings {
+        PostProcessSettings(
+            enabled: postProcessEnabled,
+            authMethod: geminiAuthMethod,
+            model: postProcessModel,
+            prompt: postProcessPrompt,
+            vertexProject: vertexProject,
+            vertexRegion: vertexRegion
+        )
     }
 }
