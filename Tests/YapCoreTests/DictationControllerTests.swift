@@ -257,6 +257,25 @@ final class DictationControllerTests: XCTestCase {
         XCTAssertEqual(result.value, "hello from the tail")   // tail kept, not dropped
     }
 
+    func testTrailingCaptureKeepsMicOpenBeforeStop() async throws {
+        // The mic must keep recording for `trailingCaptureSeconds` AFTER the stop toggle, so a
+        // word spoken right up to the keypress is still captured. Without it, capture stops
+        // instantly and that last word's audio is lost.
+        let capturer = FakeCapturer()
+        let client = ScriptedClient()
+        let controller = DictationController(
+            capturer: capturer, clientFactory: { client },
+            trailingCaptureSeconds: 0.2, flushDelaySeconds: 0, finalizeTimeoutSeconds: 0.1)
+        await controller.setHandlers(onState: { _ in }, onResult: { _ in })
+
+        await controller.toggle()                       // listening
+        let finishing = Task { await controller.toggle() }  // finalize: holds the mic open
+        try await Task.sleep(nanoseconds: 60_000_000)   // 60ms — inside the 200ms trailing window
+        XCTAssertEqual(capturer.stopCount, 0)           // mic still capturing the tail
+        await finishing.value
+        XCTAssertEqual(capturer.stopCount, 1)           // stopped only after the window
+    }
+
     func testReconnectsOnSocketClosedAndPrimesContext() async throws {
         // A mid-listening connection drop must reconnect (not error), keep the accumulated
         // text, and hand the new connection the context tail so the model resumes coherently.

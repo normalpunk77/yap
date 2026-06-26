@@ -86,7 +86,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
                     )
                     return DeepgramRealtimeClient(socket: socket)
                 }
-            }
+            },
+            // Keep the mic open ~0.25s after stop so a word spoken right up to the keypress is
+            // still captured (its audio isn't recorded yet at the instant of the press).
+            trailingCaptureSeconds: 0.25
         )
         self.controller = controller
 

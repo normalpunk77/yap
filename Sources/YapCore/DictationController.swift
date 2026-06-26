@@ -22,6 +22,7 @@ public enum DictationState: Equatable, Sendable {
 public actor DictationController {
     private let capturer: AudioCapturer
     private let clientFactory: @Sendable () throws -> TranscriptionClient
+    private let trailingCaptureNanos: UInt64
     private let flushDelayNanos: UInt64
     private let finalizeTimeoutNanos: UInt64
     private let reconnectBackoffNanos: UInt64
@@ -44,6 +45,10 @@ public actor DictationController {
     private var partial = ""
     public private(set) var state: DictationState = .idle
 
+    // `trailingCaptureSeconds`: keep the mic running this long AFTER the user hits stop, before
+    // closing capture — so a word spoken right up to the keypress is still recorded (the audio
+    // for it hasn't been captured yet at the instant of the press). Defaults to 0 here (tests
+    // opt in); the app sets ~0.25s.
     // `flushDelaySeconds`: how long to let the last in-flight audio reach the server after the
     // mic stops, before sending the commit. `finalizeTimeoutSeconds`: a SAFETY-NET cap — the
     // final segment normally arrives on its own and delivers immediately (see `handle`), so a
@@ -53,12 +58,14 @@ public actor DictationController {
     public init(
         capturer: AudioCapturer,
         clientFactory: @escaping @Sendable () throws -> TranscriptionClient,
+        trailingCaptureSeconds: Double = 0,
         flushDelaySeconds: Double = 0.25,
         finalizeTimeoutSeconds: Double = 3.0,
         reconnectBackoffSeconds: Double = 0.5
     ) {
         self.capturer = capturer
         self.clientFactory = clientFactory
+        self.trailingCaptureNanos = UInt64(max(0, trailingCaptureSeconds) * 1_000_000_000)
         self.flushDelayNanos = UInt64(max(0, flushDelaySeconds) * 1_000_000_000)
         self.finalizeTimeoutNanos = UInt64(max(0, finalizeTimeoutSeconds) * 1_000_000_000)
         self.reconnectBackoffNanos = UInt64(max(0, reconnectBackoffSeconds) * 1_000_000_000)
@@ -136,6 +143,10 @@ public actor DictationController {
 
     private func finalize() async {
         setState(.finalizing)
+        // Keep the mic open briefly so a word spoken right up to the keypress is still captured
+        // (its audio isn't recorded yet at the instant of the press). Chunks keep flowing to the
+        // live client during this window via `forwardChunk`.
+        if trailingCaptureNanos > 0 { try? await Task.sleep(nanoseconds: trailingCaptureNanos) }
         await stopCapture()
         // Let the last in-flight audio chunk reach the server before committing,
         // so the tail of fast speech still gets transcribed.
