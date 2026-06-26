@@ -233,6 +233,30 @@ final class DictationControllerTests: XCTestCase {
         XCTFail("waitFor: condition not met in time", file: file, line: line)
     }
 
+    func testFinalizeWaitsForLateFlushResult() async throws {
+        // Regression: the last words spoken right before stop arrive from the provider only
+        // AFTER the user toggles stop — Deepgram returns them as the `Finalize` flush result a
+        // few hundred ms later. The default finalize timeout must be generous enough to wait for
+        // that result; a too-short default (the 0.4s regression) fired `forceFinish` first,
+        // delivered nothing/partial, then DISCARDED the late committed → dropped tail. Uses the
+        // DEFAULT timeout on purpose: the default itself was the bug.
+        let capturer = FakeCapturer()
+        let client = ScriptedClient()
+        let controller = DictationController(capturer: capturer, clientFactory: { client }, flushDelaySeconds: 0)
+        let result = ResultBox()
+        await controller.setHandlers(onState: { _ in }, onResult: { t in result.set(t) })
+
+        await controller.toggle()   // listening
+        await controller.toggle()   // finalize → arms the default timeout
+        // Simulate Deepgram's flush round-trip: the final segment lands ~0.5s after stop —
+        // longer than the old 0.4s default that truncated, well within a correct one.
+        try await Task.sleep(nanoseconds: 500_000_000)
+        client.emit(.committed("hello from the tail"))
+        try await waitFor { result.value != nil }
+
+        XCTAssertEqual(result.value, "hello from the tail")   // tail kept, not dropped
+    }
+
     func testReconnectsOnSocketClosedAndPrimesContext() async throws {
         // A mid-listening connection drop must reconnect (not error), keep the accumulated
         // text, and hand the new connection the context tail so the model resumes coherently.
