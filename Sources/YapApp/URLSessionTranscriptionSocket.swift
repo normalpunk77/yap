@@ -43,7 +43,7 @@ final class URLSessionTranscriptionSocket: NSObject, TranscriptionSocket, URLSes
     }
 
     /// Deepgram live STT. Audio is sent as raw `linear16` binary frames (our PCM16 as-is);
-    /// control (Finalize/CloseStream) goes as text. Nova-3 + smart_format + interim
+    /// control (Finalize/CloseStream) goes as text. Nova-3 + punctuation + interim
     /// results, with endpointing so segments finalize on natural pauses.
     static func makeDeepgram(apiKey: String,
                              model: String = "nova-3",
@@ -61,7 +61,11 @@ final class URLSessionTranscriptionSocket: NSObject, TranscriptionSocket, URLSes
             URLQueryItem(name: "encoding", value: "linear16"),
             URLQueryItem(name: "sample_rate", value: String(sampleRate)),
             URLQueryItem(name: "channels", value: "1"),
-            URLQueryItem(name: "smart_format", value: "true"),
+            // `punctuate`, NOT `smart_format`: smart_format also converts spoken numbers and
+            // ordinals to digits (Italian "prima" → "1ª"), which is wrong for faithful
+            // dictation. punctuate keeps punctuation + capitalization and leaves words as
+            // spoken. (Number-to-digit conversion, if wanted, is the AI cleanup's job.)
+            URLQueryItem(name: "punctuate", value: "true"),
             URLQueryItem(name: "interim_results", value: "true"),
             URLQueryItem(name: "endpointing", value: endpointing),
             URLQueryItem(name: "utterance_end_ms", value: "1000"),
