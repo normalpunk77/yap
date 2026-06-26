@@ -44,11 +44,17 @@ public actor DictationController {
     private var partial = ""
     public private(set) var state: DictationState = .idle
 
+    // `flushDelaySeconds`: how long to let the last in-flight audio reach the server after the
+    // mic stops, before sending the commit. `finalizeTimeoutSeconds`: a SAFETY-NET cap — the
+    // final segment normally arrives on its own and delivers immediately (see `handle`), so a
+    // generous value adds no latency in the common case; it only bounds the rare "provider went
+    // silent" stop. These must stay generous: a too-short timeout (the 0.1/0.4 regression) fired
+    // before Deepgram's `Finalize` flush result arrived, truncating the spoken tail.
     public init(
         capturer: AudioCapturer,
         clientFactory: @escaping @Sendable () throws -> TranscriptionClient,
-        flushDelaySeconds: Double = 0.1,
-        finalizeTimeoutSeconds: Double = 0.4,
+        flushDelaySeconds: Double = 0.25,
+        finalizeTimeoutSeconds: Double = 3.0,
         reconnectBackoffSeconds: Double = 0.5
     ) {
         self.capturer = capturer
