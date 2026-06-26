@@ -22,6 +22,15 @@ final class ParakeetManager: ObservableObject {
 
     private var daemon: Process?
     private var socketURL: URL { support.appendingPathComponent("parakeet.sock") }
+    /// Pid file under Yap's control. The daemon refuses to start if its pid file already
+    /// exists, so we pass an explicit path we can clean up (rather than the binary's default).
+    private var pidURL: URL { support.appendingPathComponent("parakeet.pid") }
+    /// The binary's *default* pid path — used to clean up daemons older builds launched
+    /// without `--pid-file`, whose stale pid file would otherwise block a new start.
+    private var defaultPidURL: URL {
+        fm.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("parakeet/run/daemon.pid")
+    }
     /// Where the daemon's stdout/stderr go, so a failed start (mic denied, model error) is
     /// diagnosable instead of vanishing into /dev/null. Truncated each time the daemon starts.
     var daemonLogURL: URL { support.appendingPathComponent("parakeet-daemon.log") }
@@ -69,12 +78,17 @@ final class ParakeetManager: ObservableObject {
     func ensureDaemonRunning() async throws {
         if let daemon, daemon.isRunning { return }
         guard let bin = binaryPath else { throw ParakeetError.buildProducedNoBinary }
+        // A daemon orphaned by a previous session (force-quit, crash) keeps running and leaves
+        // its pid file behind; the binary then refuses to start ("PID file ... File exists").
+        // Kill the orphan and clear the stale pid + socket before launching a fresh one.
+        terminateOrphanedDaemon()
         try? fm.removeItem(at: socketURL)
         let process = Process()
         process.executableURL = URL(fileURLWithPath: bin)
         process.arguments = ["serve",
                              "--model-dir", modelDir.path,
                              "--socket", socketURL.path,
+                             "--pid-file", pidURL.path,
                              "--clipboard"]
         // Send the daemon's output to a log file (not /dev/null) so a failed start is
         // diagnosable. Fall back to discarding if the file can't be created.
@@ -89,12 +103,29 @@ final class ParakeetManager: ObservableObject {
         }
         try process.run()
         daemon = process
-        // Wait (≤10 s) for the daemon to load the model and create its socket.
-        for _ in 0 ..< 200 {
+        // Wait up to ~30 s for the daemon to load the model and create its socket — a cold
+        // start (large model off disk, first-run VAD download) can take a while. Bail out
+        // immediately if the daemon exits early (e.g. a config error), so we surface the real
+        // failure fast instead of waiting out the whole timeout.
+        for _ in 0 ..< 600 {
+            if !process.isRunning { throw ParakeetError.daemonDidNotStart }
             if fm.fileExists(atPath: socketURL.path) { return }
             try await Task.sleep(nanoseconds: 50_000_000)
         }
         throw ParakeetError.daemonDidNotStart
+    }
+
+    /// Terminate a daemon left running by a previous session and remove its pid file (both the
+    /// path we pass now and the binary's default, for daemons older builds started). Without
+    /// this, the leftover pid file makes every new daemon refuse to start.
+    private func terminateOrphanedDaemon() {
+        for pidFile in [pidURL, defaultPidURL] {
+            if let contents = try? String(contentsOf: pidFile, encoding: .utf8),
+               let pid = Int32(contents.trimmingCharacters(in: .whitespacesAndNewlines)), pid > 0 {
+                kill(pid, SIGTERM)
+            }
+            try? fm.removeItem(at: pidFile)
+        }
     }
 
     /// Send a one-word control command (start/stop/toggle/shutdown) to the daemon socket.
@@ -117,6 +148,7 @@ final class ParakeetManager: ObservableObject {
         daemon?.terminate()
         daemon = nil
         try? fm.removeItem(at: socketURL)
+        try? fm.removeItem(at: pidURL)
     }
 
     // MARK: - Build
