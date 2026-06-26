@@ -47,7 +47,10 @@ public final class ElevenLabsRealtimeClient: TranscriptionClient, @unchecked Sen
                 do {
                     while !Task.isCancelled {
                         let data = try await socket.receive()
-                        if data.isEmpty { continuation.yield(.failed(.socketClosed)); break }
+                        if data.isEmpty {
+                            Diag.conn.error("ElevenLabs: empty inbound frame → server closed the stream")
+                            continuation.yield(.failed(.socketClosed)); break
+                        }
                         switch try ElevenLabsResponse.decode(data, decoder: decoder) {
                         case .partial(let t): continuation.yield(.partial(t))
                         case .committed(let t): continuation.yield(.committed(t))
@@ -56,8 +59,10 @@ public final class ElevenLabsRealtimeClient: TranscriptionClient, @unchecked Sen
                         }
                     }
                 } catch let e as TranscriptionError {
+                    Diag.conn.error("ElevenLabs stream error: \(String(describing: e), privacy: .public)")
                     continuation.yield(.failed(e))
                 } catch {
+                    Diag.conn.error("ElevenLabs socket dropped: \(Diag.describe(error), privacy: .public)")
                     continuation.yield(.failed(.socketClosed))
                 }
                 continuation.finish()

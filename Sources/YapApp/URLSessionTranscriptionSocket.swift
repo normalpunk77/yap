@@ -1,14 +1,21 @@
 import Foundation
 import YapCore
 
-final class URLSessionTranscriptionSocket: NSObject, TranscriptionSocket, @unchecked Sendable {
-    private let session: URLSession
-    private let task: URLSessionWebSocketTask
+final class URLSessionTranscriptionSocket: NSObject, TranscriptionSocket, URLSessionWebSocketDelegate, @unchecked Sendable {
+    private let provider: String
+    private let startedAt = Date()
+    private var session: URLSession!
+    private var task: URLSessionWebSocketTask!
 
-    init(session: URLSession, task: URLSessionWebSocketTask) {
-        self.session = session
-        self.task = task
+    init(request: URLRequest, provider: String) {
+        self.provider = provider
         super.init()
+        // Own the session with `self` as delegate so the WebSocket open/close lifecycle is
+        // observable — the close CODE is the single most telling clue for a dropped stream.
+        let session = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
+        self.session = session
+        self.task = session.webSocketTask(with: request)
+        Diag.conn.info("\(self.provider, privacy: .public): connecting…")
         task.resume()
     }
 
@@ -32,9 +39,7 @@ final class URLSessionTranscriptionSocket: NSObject, TranscriptionSocket, @unche
         comps.queryItems = items
         var req = URLRequest(url: comps.url!)
         req.setValue(apiKey, forHTTPHeaderField: "xi-api-key")
-        let session = URLSession(configuration: .default)
-        let task = session.webSocketTask(with: req)
-        return URLSessionTranscriptionSocket(session: session, task: task)
+        return URLSessionTranscriptionSocket(request: req, provider: "ElevenLabs")
     }
 
     /// Deepgram live STT. Audio is sent as raw `linear16` binary frames (our PCM16 as-is);
@@ -68,9 +73,7 @@ final class URLSessionTranscriptionSocket: NSObject, TranscriptionSocket, @unche
         comps.queryItems = items
         var req = URLRequest(url: comps.url!)
         req.setValue("Token \(apiKey)", forHTTPHeaderField: "Authorization")
-        let session = URLSession(configuration: .default)
-        let task = session.webSocketTask(with: req)
-        return URLSessionTranscriptionSocket(session: session, task: task)
+        return URLSessionTranscriptionSocket(request: req, provider: "Deepgram")
     }
 
     func send(_ data: Data) async throws {
@@ -100,8 +103,10 @@ final class URLSessionTranscriptionSocket: NSObject, TranscriptionSocket, @unche
             // Surface the real handshake failure (e.g. 401 key, 400 params,
             // 403 no model access, 404 endpoint) instead of a generic close.
             if let http = task.response as? HTTPURLResponse {
+                Diag.conn.error("\(self.provider, privacy: .public): receive failed, HTTP \(http.statusCode)")
                 throw TranscriptionError.unknown("HTTP \(http.statusCode)")
             }
+            Diag.conn.error("\(self.provider, privacy: .public): receive failed: \(Diag.describe(error), privacy: .public)")
             throw TranscriptionError.unknown((error as NSError).localizedDescription)
         }
     }
@@ -112,5 +117,26 @@ final class URLSessionTranscriptionSocket: NSObject, TranscriptionSocket, @unche
         // task ends, so without this each dictation would leave one behind. This
         // releases it deterministically — no accumulation across many sessions.
         session.finishTasksAndInvalidate()
+    }
+
+    // MARK: - URLSessionWebSocketDelegate (diagnostics only)
+
+    func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask,
+                    didOpenWithProtocol proto: String?) {
+        Diag.conn.info("\(self.provider, privacy: .public): WebSocket opened")
+    }
+
+    func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask,
+                    didCloseWith closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {
+        let secs = Date().timeIntervalSince(startedAt)
+        let reasonStr = reason.flatMap { String(data: $0, encoding: .utf8) } ?? "—"
+        // closeCode 1000=normal, 1001=going away, 1006=abnormal (no close frame / network
+        // drop), 1011=server error, 4xxx=provider-specific (auth/quota/protocol).
+        Diag.conn.error("\(self.provider, privacy: .public): WebSocket closed code=\(closeCode.rawValue) reason=\(reasonStr, privacy: .public) after \(secs, format: .fixed(precision: 1))s")
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        guard let error else { return }
+        Diag.conn.error("\(self.provider, privacy: .public): transport error: \(Diag.describe(error), privacy: .public)")
     }
 }

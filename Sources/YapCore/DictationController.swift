@@ -183,6 +183,7 @@ public actor DictationController {
             if case .socketClosed = error, case .listening = state, capturing {
                 await reconnect()
             } else {
+                Diag.conn.error("fatal stream error → stopping: \(String(describing: error), privacy: .public)")
                 await teardown()
                 setState(.error("\(error)"))
             }
@@ -194,10 +195,12 @@ public actor DictationController {
     private func reconnect() async {
         reconnectAttempts += 1
         guard reconnectAttempts <= maxReconnects else {
+            Diag.conn.error("reconnect gave up after \(self.maxReconnects) attempts — surfacing 'Connection closed'")
             await teardown()
             setState(.error("socketClosed"))
             return
         }
+        Diag.conn.error("stream dropped mid-dictation — reconnecting (attempt \(self.reconnectAttempts)/\(self.maxReconnects))")
         // Drop the dead client and its event loop; the mic keeps capturing (chunks are
         // harmlessly discarded while `client` is nil during the gap).
         eventTask?.cancel()

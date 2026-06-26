@@ -119,6 +119,10 @@ or a security scanner. The short version:
 - **Your API key is stored locally** in `UserDefaults` (not the Keychain — see
   [`APIKeyStore.swift`](Sources/YapApp/APIKeyStore.swift) for the honest reasoning and
   tradeoff). It never leaves your machine except to the provider you configured.
+- **Diagnostic logging is local and non-sensitive.** Yap logs the connection lifecycle
+  (provider, WebSocket close codes, network errors, reconnects) to the macOS unified log to
+  diagnose dropped streams — never your audio, transcript, or key, and never sent anywhere
+  ([`Diagnostics.swift`](Sources/YapCore/Diagnostics.swift)).
 
 Full threat model, permission rationale, and verification commands are in **[SECURITY.md](SECURITY.md)**.
 
@@ -134,7 +138,8 @@ grep -rniE "https?://|wss?://" Sources/
 grep -rniE "CGEventTapCreate|addGlobalMonitorForEvents|addLocalMonitorForEvents|IOHIDManager" Sources/
 # (The only CGEvent use is POSTING the ⌘V paste — output, not input. See: grep -rn CGEvent Sources/)
 
-# Prove there are no hidden secrets and no logging of sensitive data (expect no matches):
+# No hardcoded secrets, no ad-hoc print/NSLog (expect no matches). Diagnostic logging goes
+# through os.Logger in Diagnostics.swift — connection metadata only, never audio/keys:
 grep -rniE "sk-[a-z0-9]|NSLog|os_log|print\(" Sources/
 
 # Prove there are no external dependencies (expect no matches):

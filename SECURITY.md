@@ -99,6 +99,19 @@ never leaves your machine except to the provider you configured. If you prefer K
 storage, build with a stable signing identity and swap `APIKeyStore` accordingly; the type is
 small and isolated for exactly this reason.
 
+## Diagnostics & logging
+
+To diagnose dropped connections, Yap writes the connection lifecycle — provider, WebSocket
+open/close codes, network errors, and reconnect attempts — to the macOS **unified log**. This
+is **local only** (Console.app / `log stream`), never transmitted anywhere, so it is not
+telemetry. It logs **no** audio, transcript text, or API key. The single logger and its
+privacy contract live in [`Diagnostics.swift`](Sources/YapCore/Diagnostics.swift); inspect the
+output yourself:
+
+```bash
+log stream --predicate 'subsystem == "io.github.normalpunk77.yap"' --info
+```
+
 ## App Sandbox
 
 Yap is **not** App-Sandboxed, and can't be: pasting at the cursor needs Accessibility

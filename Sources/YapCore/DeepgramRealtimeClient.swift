@@ -37,7 +37,10 @@ public final class DeepgramRealtimeClient: TranscriptionClient, @unchecked Senda
                 do {
                     while !Task.isCancelled {
                         let data = try await socket.receive()
-                        if data.isEmpty { continuation.yield(.failed(.socketClosed)); break }
+                        if data.isEmpty {
+                            Diag.conn.error("Deepgram: empty inbound frame → server closed the stream")
+                            continuation.yield(.failed(.socketClosed)); break
+                        }
                         switch try DeepgramResponse.decode(data, decoder: decoder) {
                         case .partial(let t): continuation.yield(.partial(t))
                         case .committed(let t): continuation.yield(.committed(t))
@@ -45,8 +48,10 @@ public final class DeepgramRealtimeClient: TranscriptionClient, @unchecked Senda
                         }
                     }
                 } catch let e as TranscriptionError {
+                    Diag.conn.error("Deepgram stream error: \(String(describing: e), privacy: .public)")
                     continuation.yield(.failed(e))
                 } catch {
+                    Diag.conn.error("Deepgram socket dropped: \(Diag.describe(error), privacy: .public)")
                     continuation.yield(.failed(.socketClosed))
                 }
                 continuation.finish()
