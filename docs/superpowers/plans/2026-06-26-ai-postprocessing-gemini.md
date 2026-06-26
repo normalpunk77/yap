@@ -1,6 +1,30 @@
 # AI Post-Processing (Gemini) Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+## Execution strategy
+
+- **Mode:** inline (executed in-session, with a build/test checkpoint per task).
+- **One PR to `main` per phase.** Each phase is committed on its own branch and opened as a
+  PR against `main` of the canonical repo **`normalpunk77/yap`** (remote `public`).
+- **Git rules (from project memory):** act as `normalpunk77` via `env -u GH_TOKEN` for all `gh`
+  and push operations. **Never push to `origin` (`RobyJB/dictabar`).** PR base is `public/main`,
+  which is a direct ancestor of the working branch (clean target).
+- After each phase PR is green and merged into `public/main`, the next phase branches off the
+  updated `public/main`, so phases never stack.
+
+### Phases (one PR each)
+
+- **Phase 1 — Gemini core (API key):** Tasks 1–4 + design docs. Pure `YapCore`, fully unit-tested:
+  settings/types, wire model, API-key processor, and the never-lose-text runner.
+  Branch `feat/postproc-core` → PR to `main`.
+- **Phase 2 — Vertex auth:** Tasks 5–6. RS256 JWT + OAuth token minting and the Vertex
+  request path, unit-tested. Branch `feat/postproc-vertex` → PR to `main`.
+- **Phase 3 — App integration:** Tasks 7–10. Keychain store, `AppConfig` persistence, unified
+  `deliver(text:)` wiring for all engines, and the Settings UI + Save & Verify. Branch
+  `feat/postproc-app` → PR to `main`.
+
+---
 
 **Goal:** Run a user-configurable Gemini cleanup pass on the final transcript (all engines) before it is pasted, with API-key and Vertex service-account auth.
 
