@@ -16,6 +16,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private var activeHotKey: HotKeyShortcut?    // the last shortcut that registered OK
     private var controller: DictationController!
     private var dictationActivity: NSObjectProtocol?
+    private var didPromptForKey = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -134,11 +135,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             updateIcon(recording: false)
             edgeGlow.hide()
             if message.contains("missingAPIKey") {
-                openSettings()   // opening Settings IS the prompt to set the key
+                promptForAPIKeyOnce()
             } else {
                 presentError(Self.humanize(message))
             }
         }
+    }
+
+    /// No API key set: open Settings the FIRST time you try to dictate (helpful for a new
+    /// user), then stop — so pressing the hotkey again doesn't keep popping the window. Also
+    /// a no-op when Settings is already open.
+    private func promptForAPIKeyOnce() {
+        if settingsWindow?.isVisible == true { return }
+        guard !didPromptForKey else { NSSound.beep(); return }
+        didPromptForKey = true
+        openSettings()
     }
 
     /// Surface a dictation failure. The aura can't show text, so genuine errors
