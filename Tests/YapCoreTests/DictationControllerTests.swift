@@ -203,20 +203,32 @@ final class DictationControllerTests: XCTestCase {
         let client = ScriptedClient()
         let controller = DictationController(
             capturer: capturer, clientFactory: { client },
-            flushDelaySeconds: 0, finalizeTimeoutSeconds: 0.05)
+            flushDelaySeconds: 0, finalizeTimeoutSeconds: 0.1)
         let result = ResultBox()
         await controller.setHandlers(onState: { _ in }, onResult: { t in result.set(t) })
 
         await controller.toggle()             // listening
         client.emit(.committed("hello"))       // committed segment
         client.emit(.partial("world"))         // uncommitted tail, never committed
-        try await Task.sleep(nanoseconds: 20_000_000)
+        // Wait until BOTH events are processed (deterministic — no fixed sleep, so it can't
+        // race the async event loop on a slow CI runner, which made this test flaky).
+        try await waitFor { await controller.state == .listening("hello world") }
         await controller.toggle()              // finalize; no further committed arrives
-        try await Task.sleep(nanoseconds: 80_000_000)  // past the 0.05s finalize timeout
+        try await waitFor { await controller.state == .idle }   // wait for delivery
 
         XCTAssertEqual(result.value, "hello world")    // tail kept, not dropped
-        let end = await controller.state
-        XCTAssertEqual(end, .idle)
+    }
+
+    /// Poll `cond` until true (or fail). Replaces brittle fixed-duration sleeps in async
+    /// timing tests: returns as soon as the expected state is reached, robust under CI load.
+    private func waitFor(tries: Int = 300, stepNanos: UInt64 = 10_000_000,
+                         _ cond: () async -> Bool,
+                         file: StaticString = #filePath, line: UInt = #line) async throws {
+        for _ in 0 ..< tries {
+            if await cond() { return }
+            try await Task.sleep(nanoseconds: stepNanos)
+        }
+        XCTFail("waitFor: condition not met in time", file: file, line: line)
     }
 
     func testReconnectsOnSocketClosedAndPrimesContext() async throws {
