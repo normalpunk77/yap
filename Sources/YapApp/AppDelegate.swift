@@ -12,6 +12,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private var settingsWindow: NSWindow?
     private let edgeGlow = EdgeGlowHUD()         // the aura — the only recording indicator
     private let micCapture = MicrophoneCapture()
+    // A second, level-only mic tap used ONLY during Parakeet dictation: the transcription mic
+    // lives in the daemon (another process), so this is how the aura gets real voice levels to
+    // react to. Independent of the daemon — if it can't start, the aura just self-breathes.
+    private let parakeetMeter = MicrophoneCapture()
     private var hotKey: HotKeyManager!
     private var activeHotKey: HotKeyShortcut?    // the last shortcut that registered OK
     private var controller: DictationController!
@@ -156,14 +160,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         if recording {
             beginDictationActivity()
             updateIcon(recording: true)
-            // Parakeet's mic lives in the daemon, so no levels reach `micCapture` — show the
-            // aura in self-breathing mode instead of leaving it stuck at a dead baseline.
+            // Show the aura immediately in self-breathing mode (no levels yet), then start a
+            // parallel level meter so it reacts to the real voice once audio flows.
             edgeGlow.show(voiceReactive: false)
+            startParakeetMeter()
         } else {
             endDictationActivity()
             updateIcon(recording: false)
             edgeGlow.hide()
+            stopParakeetMeter()
         }
+    }
+
+    /// Drive the aura from a real mic level meter during Parakeet dictation. The daemon owns the
+    /// transcription mic in another process; this independent tap exists only to give the aura
+    /// the user's voice. Best-effort: on failure the aura keeps self-breathing.
+    private func startParakeetMeter() {
+        parakeetMeter.onLevel = { [weak self] level in
+            Task { @MainActor in
+                self?.edgeGlow.setVoiceReactive(true)
+                self?.edgeGlow.updateLevel(level)
+            }
+        }
+        Task {
+            do { try await parakeetMeter.start(onChunk: { _ in }) }
+            catch { /* keep the self-breathing aura; transcription (daemon) is unaffected */ }
+        }
+    }
+
+    private func stopParakeetMeter() {
+        parakeetMeter.onLevel = nil
+        Task { await parakeetMeter.stop() }
     }
 
     private func render(_ state: DictationState) {

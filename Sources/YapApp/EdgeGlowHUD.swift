@@ -53,6 +53,11 @@ final class EdgeGlowHUD {
         panel?.orderFrontRegardless()
     }
 
+    /// Flip between voice-reactive (real mic levels) and self-breathing (synthetic). Used by
+    /// the Parakeet path: it shows breathing immediately, then switches to true reactivity once
+    /// its parallel level meter starts delivering real levels.
+    func setVoiceReactive(_ on: Bool) { model.voiceReactive = on }
+
     func updateLevel(_ level: Double) {
         // Just record the raw target; the smoothing happens per render frame (dt-aware)
         // so it stays fluid regardless of how coarsely the mic reports levels.

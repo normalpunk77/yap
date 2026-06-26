@@ -47,6 +47,10 @@ final class ParakeetController {
 
     private func stop() async {
         recording = false
+        // Recording has ended — drop the aura (and the level meter) immediately, regardless of
+        // whether any speech was captured. Otherwise a press-without-speaking left the aura lit
+        // for the whole no-speech timeout below.
+        onRecording?(false)
         let clipboardBefore = NSPasteboard.general.changeCount
         manager.sendDaemonCommand("stop")
         // The daemon transcribes (~0.5 s) then copies the text to the clipboard. Paste it as
@@ -55,11 +59,9 @@ final class ParakeetController {
             try? await Task.sleep(nanoseconds: 50_000_000)   // 50 ms × 120 ≈ 6 s
             if NSPasteboard.general.changeCount != clipboardBefore {
                 let text = NSPasteboard.general.string(forType: .string) ?? ""
-                onRecording?(false)
                 if !text.isEmpty { Paster.pasteAtCursor(text) }
                 return
             }
         }
-        onRecording?(false)
     }
 }
