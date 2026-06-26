@@ -5,11 +5,16 @@ import Foundation
 public enum TranscriptionProvider: String, CaseIterable, Sendable {
     case elevenLabs
     case deepgram
+    case parakeetLocal
 
     public var displayName: String {
         switch self {
         case .elevenLabs: return "ElevenLabs (Scribe v2)"
         case .deepgram: return "Deepgram (Nova-3)"
+        case .parakeetLocal: return "Parakeet (on-device)"
         }
     }
+
+    /// Runs entirely on-device — no API key, no network.
+    public var isLocal: Bool { self == .parakeetLocal }
 }

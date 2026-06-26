@@ -87,6 +87,42 @@ struct SettingsView: View {
     @State private var hotKey: HotKeyShortcut = AppConfig.hotKey
     @State private var hotKeyStatus: String = ""
 
+    // Local engine (Parakeet) setup state
+    @ObservedObject private var parakeet = ParakeetManager.shared
+
+    @ViewBuilder
+    private var parakeetSetup: some View {
+        switch parakeet.phase {
+        case .downloading(let p):
+            VStack(alignment: .leading, spacing: 4) {
+                ProgressView(value: p.fileFraction)
+                Text("Downloading model — \(p.label)").font(.caption).foregroundStyle(.secondary)
+            }
+        case .checkingTools, .cloning, .building:
+            HStack(spacing: 8) {
+                ProgressView().controlSize(.small)
+                Text("Building the engine on your Mac…").font(.caption).foregroundStyle(.secondary)
+            }
+        case .failed(let msg):
+            VStack(alignment: .leading, spacing: 6) {
+                Text("⚠️ \(msg)").font(.caption).foregroundStyle(Color.red)
+                Button("Retry") { Task { await parakeet.ensureReady() } }
+            }
+        case .ready:
+            Label("On-device engine ready", systemImage: "checkmark.circle.fill").foregroundStyle(Color.green)
+        case .idle:
+            if parakeet.isReady {
+                Label("On-device engine ready", systemImage: "checkmark.circle.fill").foregroundStyle(Color.green)
+            } else {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Runs fully on your Mac — no API key, no network. First-time setup builds the engine (needs Rust/cargo) and downloads ~670 MB.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Button("Set up Parakeet") { Task { await parakeet.ensureReady() } }
+                }
+            }
+        }
+    }
+
     var body: some View {
         Form {
             Section("General") {
@@ -151,30 +187,34 @@ struct SettingsView: View {
                     status = ""
                 }
 
-                SecureField(provider == .elevenLabs ? "xi-api-key" : "Deepgram API key", text: $apiKey)
-                    .textFieldStyle(.roundedBorder)
+                if provider.isLocal {
+                    parakeetSetup
+                } else {
+                    SecureField(provider == .elevenLabs ? "xi-api-key" : "Deepgram API key", text: $apiKey)
+                        .textFieldStyle(.roundedBorder)
 
-                if provider == .elevenLabs {
-                    Toggle("Remove filler words (no_verbatim)", isOn: $noVerbatim)
-                        .help("Strips “ehm”, false starts and hesitations for a cleaner transcript.")
-                        .onChange(of: noVerbatim) { _, newValue in AppConfig.noVerbatim = newValue }
-                }
-
-                if provider == .deepgram {
-                    Picker("Language", selection: $language) {
-                        ForEach(Self.languages, id: \.code) { lang in
-                            Text(lang.label).tag(lang.code)
-                        }
+                    if provider == .elevenLabs {
+                        Toggle("Remove filler words (no_verbatim)", isOn: $noVerbatim)
+                            .help("Strips “ehm”, false starts and hesitations for a cleaner transcript.")
+                            .onChange(of: noVerbatim) { _, newValue in AppConfig.noVerbatim = newValue }
                     }
-                    // Persist immediately so the choice sticks without needing Save & Verify
-                    // (it used to revert to the default on reopen).
-                    .onChange(of: language) { _, newValue in AppConfig.language = newValue }
-                    .help("Deepgram assumes English without this — pick your language, or Multilingual to mix languages in one phrase. ElevenLabs auto-detects.")
-                }
 
-                HStack(spacing: 10) {
-                    Button("Save & Verify") { saveAndVerify() }
-                    Text(status).font(.callout).foregroundStyle(.secondary)
+                    if provider == .deepgram {
+                        Picker("Language", selection: $language) {
+                            ForEach(Self.languages, id: \.code) { lang in
+                                Text(lang.label).tag(lang.code)
+                            }
+                        }
+                        // Persist immediately so the choice sticks without needing Save & Verify
+                        // (it used to revert to the default on reopen).
+                        .onChange(of: language) { _, newValue in AppConfig.language = newValue }
+                        .help("Deepgram assumes English without this — pick your language, or Multilingual to mix languages in one phrase. ElevenLabs auto-detects.")
+                    }
+
+                    HStack(spacing: 10) {
+                        Button("Save & Verify") { saveAndVerify() }
+                        Text(status).font(.callout).foregroundStyle(.secondary)
+                    }
                 }
             }
 

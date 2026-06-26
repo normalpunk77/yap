@@ -15,6 +15,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private var hotKey: HotKeyManager!
     private var activeHotKey: HotKeyShortcut?    // the last shortcut that registered OK
     private var controller: DictationController!
+    private let parakeetController = ParakeetController()
     private var dictationActivity: NSObjectProtocol?
     private var didPromptForKey = false
 
@@ -55,10 +56,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             capturer: micCapture,
             clientFactory: {
                 let provider = AppConfig.provider
+                // The local engine (Parakeet) doesn't use this WebSocket client factory at
+                // all — the hotkey routes it to ParakeetController instead. Guard anyway.
+                guard !provider.isLocal else { throw AppError.localEngineHasNoClient }
                 guard let key = APIKeyStore.loadAPIKey(for: provider), !key.isEmpty else {
                     throw AppError.missingAPIKey
                 }
                 switch provider {
+                case .parakeetLocal:
+                    throw AppError.localEngineHasNoClient   // unreachable (guarded above)
                 case .elevenLabs:
                     let socket = URLSessionTranscriptionSocket.make(
                         apiKey: key,
@@ -93,9 +99,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             )
         }
 
+        parakeetController.onRecording = { [weak self] on in self?.renderParakeet(recording: on) }
+        parakeetController.onError = { [weak self] msg in self?.presentError(msg) }
+
         hotKey = HotKeyManager(onTrigger: { [weak self] in
             Task { @MainActor in
                 guard let self else { return }
+                // Local engine (Parakeet) owns its own mic via the daemon — route there.
+                if AppConfig.provider.isLocal {
+                    await self.parakeetController.toggle()
+                    return
+                }
                 // Mic denied earlier and macOS won't re-prompt on its own: guide the
                 // user to re-enable it instead of silently failing to record.
                 guard self.ensureMicrophoneAccess() else { return }
@@ -119,6 +133,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         if !UserDefaults.standard.bool(forKey: "didOnboard") {
             UserDefaults.standard.set(true, forKey: "didOnboard")
             openSettings()
+        }
+    }
+
+    /// Drive the aura for the local-engine path (the cloud path uses `render(_:)`).
+    private func renderParakeet(recording: Bool) {
+        if recording {
+            beginDictationActivity()
+            updateIcon(recording: true)
+            edgeGlow.show()
+        } else {
+            endDictationActivity()
+            updateIcon(recording: false)
+            edgeGlow.hide()
         }
     }
 
@@ -305,7 +332,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     /// opens (menuWillOpen) so it stays accurate after the user saves a key in Settings,
     /// without any background polling.
     private func keyStatusTitle() -> String {
-        APIKeyStore.loadAPIKey(for: AppConfig.provider) == nil ? "No API key set" : "API key set ✓"
+        let provider = AppConfig.provider
+        if provider.isLocal { return "On-device engine (Parakeet)" }
+        return APIKeyStore.loadAPIKey(for: provider) == nil ? "No API key set" : "API key set ✓"
     }
 
     private func dictateHintTitle() -> String {
@@ -387,7 +416,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         }
     }
 
-    @objc private func quit() { NSApplication.shared.terminate(nil) }
+    @objc private func quit() {
+        parakeetController.shutdown()   // stop the local engine daemon, if running
+        NSApplication.shared.terminate(nil)
+    }
 
-    enum AppError: Error { case missingAPIKey }
+    enum AppError: Error { case missingAPIKey, localEngineHasNoClient }
 }

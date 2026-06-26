@@ -20,6 +20,9 @@ final class ParakeetManager: ObservableObject {
     static let shared = ParakeetManager()
     @Published private(set) var phase: Phase = .idle
 
+    private var daemon: Process?
+    private var socketURL: URL { support.appendingPathComponent("parakeet.sock") }
+
     private let fm = FileManager.default
     private var support: URL {
         fm.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -53,6 +56,55 @@ final class ParakeetManager: ObservableObject {
             phase = .failed(msg)
             Diag.conn.error("Parakeet setup failed: \(msg, privacy: .public)")
         }
+    }
+
+    // MARK: - Daemon (live dictation)
+
+    /// Start the `parakeet serve` daemon (model loaded once; controlled via a Unix socket;
+    /// `--clipboard` pastes each transcript to the clipboard). Idempotent. Waits for the
+    /// socket to appear so the first command isn't lost. Requires `isReady`.
+    func ensureDaemonRunning() async throws {
+        if let daemon, daemon.isRunning { return }
+        guard let bin = binaryPath else { throw ParakeetError.buildProducedNoBinary }
+        try? fm.removeItem(at: socketURL)
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: bin)
+        process.arguments = ["serve",
+                             "--model-dir", modelDir.path,
+                             "--socket", socketURL.path,
+                             "--clipboard"]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        daemon = process
+        // Wait (≤10 s) for the daemon to load the model and create its socket.
+        for _ in 0 ..< 200 {
+            if fm.fileExists(atPath: socketURL.path) { return }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        throw ParakeetError.daemonDidNotStart
+    }
+
+    /// Send a one-word control command (start/stop/toggle/shutdown) to the daemon socket.
+    func sendDaemonCommand(_ command: String) {
+        guard fm.fileExists(atPath: socketURL.path) else { return }
+        let nc = Process()
+        nc.executableURL = URL(fileURLWithPath: "/usr/bin/nc")
+        nc.arguments = ["-U", socketURL.path]
+        let input = Pipe()
+        nc.standardInput = input
+        nc.standardOutput = FileHandle.nullDevice
+        nc.standardError = FileHandle.nullDevice
+        guard (try? nc.run()) != nil else { return }
+        input.fileHandleForWriting.write(Data("\(command)\n".utf8))
+        try? input.fileHandleForWriting.close()
+    }
+
+    func stopDaemon() {
+        sendDaemonCommand("shutdown")
+        daemon?.terminate()
+        daemon = nil
+        try? fm.removeItem(at: socketURL)
     }
 
     // MARK: - Build
@@ -141,6 +193,7 @@ enum ParakeetError: Error {
     case missingTool(String)
     case buildProducedNoBinary
     case commandFailed(String, Int)
+    case daemonDidNotStart
 
     var message: String {
         switch self {
@@ -148,6 +201,7 @@ enum ParakeetError: Error {
         case .buildProducedNoBinary: return "Build finished but the parakeet binary wasn't produced."
         case .commandFailed(let path, let code):
             return "\((path as NSString).lastPathComponent) failed (exit \(code))."
+        case .daemonDidNotStart: return "The local engine didn't start in time."
         }
     }
 }
