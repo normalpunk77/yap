@@ -1,0 +1,8 @@
+.DS_Store
+.build/
+build/
+*.app/
+Yap.app/
+.swiftpm/
+DerivedData/
+*.iconset/

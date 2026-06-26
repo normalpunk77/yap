@@ -1,0 +1,107 @@
+import Foundation
+import YapCore
+
+/// Non-secret dictation settings, persisted in UserDefaults.
+enum AppConfig {
+    private static let keytermsKey = "keyterms"
+    private static let noVerbatimKey = "no_verbatim"
+    private static let providerKey = "stt_provider"
+    private static let inputDeviceUIDKey = "input_device_uid"
+    private static let languageKey = "stt_language"
+    private static let hotKeyCodeKey = "hotkey_keycode"
+    private static let hotKeyModsKey = "hotkey_modifiers"
+    private static let hotKeyLabelKey = "hotkey_label"
+
+    // MARK: Dictation hotkey
+
+    /// The user-chosen global hotkey that toggles dictation. Defaults to ⌥S until the user
+    /// records a different one in Settings. Persisted as its raw Carbon keyCode/modifiers
+    /// plus a display label.
+    static var hotKey: HotKeyShortcut {
+        get {
+            let d = UserDefaults.standard
+            guard d.object(forKey: hotKeyCodeKey) != nil else { return .defaultShortcut }
+            return HotKeyShortcut(
+                keyCode: UInt32(d.integer(forKey: hotKeyCodeKey)),
+                modifiers: UInt32(d.integer(forKey: hotKeyModsKey)),
+                keyLabel: d.string(forKey: hotKeyLabelKey) ?? "?")
+        }
+        set {
+            let d = UserDefaults.standard
+            d.set(Int(newValue.keyCode), forKey: hotKeyCodeKey)
+            d.set(Int(newValue.modifiers), forKey: hotKeyModsKey)
+            d.set(newValue.keyLabel, forKey: hotKeyLabelKey)
+        }
+    }
+
+    // MARK: Language
+
+    /// Spoken-language hint for the STT provider, as a Deepgram language code. Defaults
+    /// to "multi" (Nova-3 multilingual code-switching) so Italian mixed with English tech
+    /// terms transcribes correctly — without it Deepgram assumes English and garbles
+    /// other languages. ElevenLabs auto-detects and ignores this.
+    static var language: String {
+        get { UserDefaults.standard.string(forKey: languageKey) ?? "multi" }
+        set { UserDefaults.standard.set(newValue, forKey: languageKey) }
+    }
+
+    // MARK: Microphone
+
+    /// The user's chosen microphone, stored as its stable Core Audio UID. `nil` means
+    /// "follow the built-in mic" — the default that keeps a Bluetooth headset in music
+    /// mode (see MicrophoneCapture). A device that later disappears falls back to built-in.
+    static var preferredInputDeviceUID: String? {
+        get { UserDefaults.standard.string(forKey: inputDeviceUIDKey) }
+        set {
+            if let newValue {
+                UserDefaults.standard.set(newValue, forKey: inputDeviceUIDKey)
+            } else {
+                UserDefaults.standard.removeObject(forKey: inputDeviceUIDKey)
+            }
+        }
+    }
+
+    // MARK: Provider
+
+    /// The active speech-to-text provider. Defaults to ElevenLabs.
+    static var provider: TranscriptionProvider {
+        get { TranscriptionProvider(rawValue: UserDefaults.standard.string(forKey: providerKey) ?? "") ?? .elevenLabs }
+        set { UserDefaults.standard.set(newValue.rawValue, forKey: providerKey) }
+    }
+
+    // MARK: Custom dictionary (keyterms)
+
+    /// Ships EMPTY: Yap is a generic tool, so out of the box it biases recognition
+    /// toward nothing. Users add their own terms in Settings; a saved empty value is
+    /// respected (the +20% keyterms cost stays avoidable until you opt in).
+    static let defaultKeytermsRaw = ""
+
+    static func saveKeytermsRaw(_ raw: String) {
+        UserDefaults.standard.set(raw, forKey: keytermsKey)
+    }
+
+    /// Falls back to `defaultKeytermsRaw` only when nothing was ever saved (nil).
+    /// A saved empty string is preserved so the user can opt out of keyterms.
+    static func loadKeytermsRaw() -> String {
+        UserDefaults.standard.string(forKey: keytermsKey) ?? defaultKeytermsRaw
+    }
+
+    /// Parsed terms ready for the WS query: comma/newline separated, trimmed,
+    /// each capped at 20 characters, max 50 terms (ElevenLabs limits).
+    static func keyterms() -> [String] {
+        let terms = loadKeytermsRaw()
+            .split(whereSeparator: { $0 == "," || $0 == "\n" })
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .map { String($0.prefix(20)) }
+        return Array(terms.prefix(50))
+    }
+
+    // MARK: no_verbatim (strip filler words)
+
+    /// Defaults to true — a cleaner transcript is the better default for dictation.
+    static var noVerbatim: Bool {
+        get { UserDefaults.standard.object(forKey: noVerbatimKey) as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: noVerbatimKey) }
+    }
+}
