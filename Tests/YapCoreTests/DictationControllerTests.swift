@@ -214,7 +214,9 @@ final class DictationControllerTests: XCTestCase {
         // race the async event loop on a slow CI runner, which made this test flaky).
         try await waitFor { await controller.state == .listening("hello world") }
         await controller.toggle()              // finalize; no further committed arrives
-        try await waitFor { await controller.state == .idle }   // wait for delivery
+        // Wait for the actual DELIVERY, not just `.idle` — finishAndDeliver sets .idle
+        // before calling onResult (a teardown awaits in between), so polling state raced.
+        try await waitFor { result.value != nil }
 
         XCTAssertEqual(result.value, "hello world")    // tail kept, not dropped
     }

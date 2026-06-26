@@ -116,9 +116,9 @@ or a security scanner. The short version:
   surface.
 - **Least-privilege entitlements** — the app requests only `device.audio-input`
   ([`Resources/Yap.entitlements`](Resources/Yap.entitlements)).
-- **Your API key is stored locally** in `UserDefaults` (not the Keychain — see
-  [`APIKeyStore.swift`](Sources/YapApp/APIKeyStore.swift) for the honest reasoning and
-  tradeoff). It never leaves your machine except to the provider you configured.
+- **Your API key is stored in the macOS Keychain** (encrypted, access-controlled — see
+  [`APIKeyStore.swift`](Sources/YapApp/APIKeyStore.swift)), not a plaintext file. It never
+  leaves your machine except to the provider you configured.
 - **Diagnostic logging is local and non-sensitive.** Yap logs the connection lifecycle
   (provider, WebSocket close codes, network errors, reconnects) to the macOS unified log to
   diagnose dropped streams — never your audio, transcript, or key, and never sent anywhere

@@ -86,18 +86,16 @@ grep -rniE "https?://|wss?://" Sources/
 
 ## API key storage
 
-Your provider API key is stored in `UserDefaults`
-(`~/Library/Preferences/io.github.normalpunk77.yap.plist`), **not** the macOS Keychain. This is a
-deliberate, documented tradeoff for a self-built, self-signed app: the Keychain ACL is keyed
-to the code signature, which changes on every local rebuild and would silently lock you out
-of a previously-saved key. The rationale lives next to the code in
-[`APIKeyStore.swift`](Sources/YapApp/APIKeyStore.swift).
+Your provider API key is stored in the macOS **Keychain** as a generic-password item
+([`APIKeyStore.swift`](Sources/YapApp/APIKeyStore.swift)) — encrypted at rest and access-
+controlled by the OS, so it is **not** readable by a plain `defaults read` or a stray script.
+It never leaves your machine except to the provider you configured.
 
-Implication: the key sits in a plaintext plist readable by processes running as your user —
-the same trust boundary as most local developer tools that hold your own API key. The key
-never leaves your machine except to the provider you configured. If you prefer Keychain-grade
-storage, build with a stable signing identity and swap `APIKeyStore` accordingly; the type is
-small and isolated for exactly this reason.
+Note on rebuilds: Keychain access is tied to the app's code signature, so an installed copy
+keeps the key across launches. If you rebuild with a *different* ad-hoc signature you may need
+to re-enter it; create the stable `Yap Self-Signed` identity (see `scripts/build-app.sh`) to
+avoid that. On launch, Yap also wipes any plaintext keys left in `UserDefaults` by older
+builds, so nothing sensitive lingers in a readable plist.
 
 ## Diagnostics & logging
 

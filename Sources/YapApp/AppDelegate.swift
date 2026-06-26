@@ -19,6 +19,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private var didPromptForKey = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Keys now live in the Keychain; wipe any plaintext keys older builds left in
+        // UserDefaults so nothing sensitive lingers in a readable plist.
+        APIKeyStore.purgeLegacyPlaintextKeys()
+
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         updateIcon(recording: false)
 
@@ -147,7 +151,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     /// a no-op when Settings is already open.
     private func promptForAPIKeyOnce() {
         if settingsWindow?.isVisible == true { return }
-        guard !didPromptForKey else { NSSound.beep(); return }
+        guard !didPromptForKey else { return }   // already prompted once — stay silent, no nagging
         didPromptForKey = true
         openSettings()
     }
