@@ -199,6 +199,13 @@ public actor DictationController {
             // keep the mic running. Fatal errors (auth, quota, bad input) are not.
             if case .socketClosed = error, case .listening = state, capturing {
                 await reconnect()
+            } else if case .socketClosed = error, case .finalizing = state {
+                // The socket dropped during finalize — the realtime server commonly closes
+                // it right after the commit, sometimes before the final committed segment
+                // reaches us. Don't throw the dictation away with a "Connection closed"
+                // error: deliver what we've accumulated, same as the sendCommit-failure
+                // path and the finalize timeout.
+                await finishAndDeliver()
             } else {
                 Diag.conn.error("fatal stream error → stopping: \(String(describing: error), privacy: .public)")
                 await teardown()
