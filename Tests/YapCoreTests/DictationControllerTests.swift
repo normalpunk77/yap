@@ -195,6 +195,31 @@ final class DictationControllerTests: XCTestCase {
         XCTAssertEqual(end, .idle)                    // graceful, not .error
     }
 
+    func testSocketClosedDuringFinalizeDeliversAccumulatedText() async throws {
+        // Regression ("Connection closed" + lost dictation): the realtime server often
+        // closes the socket right after the commit — sometimes the `.socketClosed` event
+        // lands while we're `.finalizing`, BEFORE the final committed segment. That drop is
+        // NOT recoverable-by-reconnect (we're stopping, not listening), but it must still
+        // deliver what we've accumulated — like the sendCommit-failure path and the timeout —
+        // not surface an error and throw the whole transcript away.
+        let capturer = FakeCapturer()
+        let client = ScriptedClient()
+        let controller = DictationController(capturer: capturer, clientFactory: { client }, flushDelaySeconds: 0)
+        let result = ResultBox()
+        await controller.setHandlers(onState: { _ in }, onResult: { t in result.set(t) })
+
+        await controller.toggle()                       // listening
+        client.emit(.committed("hello world"))           // accumulated before stop
+        try await waitFor { await controller.state == .listening("hello world") }
+        await controller.toggle()                        // finalize → arms the timeout
+        client.emit(.failed(.socketClosed))              // server drops the socket post-commit
+        try await waitFor { result.value != nil }
+
+        XCTAssertEqual(result.value, "hello world")      // delivered, not lost
+        let end = await controller.state
+        XCTAssertEqual(end, .idle)                       // graceful, not .error
+    }
+
     func testFinalizeDeliversCommittedPlusTrailingPartial() async throws {
         // Regression: stopping with an uncommitted tail still in `partial`, when no final
         // committed segment arrives before the timeout, must deliver committed + partial —
