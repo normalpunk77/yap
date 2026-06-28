@@ -82,9 +82,16 @@ final class MicrophoneCapture: AudioCapturer, @unchecked Sendable {
             // self.chunkContinuation from the audio thread — that would race with stop()
             // nil-ing it. A yield after finish() is a safe no-op.
             input.installTap(onBus: 0, bufferSize: 2048, format: nil) { [weak self, continuation] buffer, _ in
-                guard let self, let samples = self.resampleToMonoFloat(buffer) else { return }
-                continuation.yield(PCM16.fromFloat(samples))
-                self.onLevel?(Self.rmsLevel(samples))
+                guard let self else { return }
+                // An NSException raised on the audio thread (e.g. AVAudioConverter choking on a
+                // malformed buffer after a route glitch) would SIGABRT the app — the shim above
+                // only guards the installTap CALL, not these per-buffer callbacks. Funnel the
+                // body through the shim too so such a fault drops a buffer instead of crashing.
+                _ = ocec_perform({
+                    guard let samples = self.resampleToMonoFloat(buffer) else { return }
+                    continuation.yield(PCM16.fromFloat(samples))
+                    self.onLevel?(Self.rmsLevel(samples))
+                }, nil)
             }
         }, &tapError)
         guard installed else {

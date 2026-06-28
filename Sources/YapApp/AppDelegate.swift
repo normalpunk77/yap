@@ -253,6 +253,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     /// Drive the aura from a real mic level meter during Parakeet dictation. The daemon owns the
     /// transcription mic in another process; this independent tap exists only to give the aura
     /// the user's voice. Best-effort: on failure the aura keeps self-breathing.
+    /// The in-flight meter-start task, so stop can wait it out (the daemon-cold start can take a
+    /// beat). Without this, a stop that lands before start() finishes would leave the meter mic
+    /// open with no stop to follow.
+    private var parakeetMeterTask: Task<Void, Never>?
+
     private func startParakeetMeter() {
         // Don't open the meter mic while the user is listening on AirPods: a second input
         // session knocks them out of music mode into call mode and interrupts their audio.
@@ -264,7 +269,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
                 self?.edgeGlow.updateLevel(level)
             }
         }
-        Task {
+        parakeetMeterTask = Task {
             do { try await parakeetMeter.start(onChunk: { _ in }) }
             catch { /* keep the self-breathing aura; transcription (daemon) is unaffected */ }
         }
@@ -272,7 +277,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
     private func stopParakeetMeter() {
         parakeetMeter.onLevel = nil
-        Task { await parakeetMeter.stop() }
+        let startTask = parakeetMeterTask
+        parakeetMeterTask = nil
+        // Let an in-flight start() settle before stopping, so stop() actually tears down the mic
+        // it opened rather than racing ahead of it.
+        Task {
+            await startTask?.value
+            await parakeetMeter.stop()
+        }
     }
 
     private func render(_ state: DictationState) {

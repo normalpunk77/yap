@@ -133,10 +133,36 @@ final class ParakeetManager: ObservableObject {
         // failure fast instead of waiting out the whole timeout.
         for _ in 0 ..< 600 {
             if !process.isRunning { throw ParakeetError.daemonDidNotStart }
-            if fm.fileExists(atPath: socketURL.path) { return }
+            // Probe an actual connect(), not just that the socket FILE exists: the file appears
+            // at bind() but the daemon only accepts after listen() — a `start` sent in that gap
+            // can be dropped. connect() succeeds only once it's truly accepting.
+            if daemonAccepting() { return }
             try await Task.sleep(nanoseconds: 50_000_000)
         }
         throw ParakeetError.daemonDidNotStart
+    }
+
+    /// True when a SOCK_STREAM connect to the daemon's Unix socket succeeds — i.e. it's actually
+    /// accepting commands. More reliable than checking for the socket file, which exists from
+    /// bind() onward (before listen()/accept()).
+    private func daemonAccepting() -> Bool {
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else { return false }
+        defer { close(fd) }
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        let pathBytes = socketURL.path.utf8CString
+        guard pathBytes.count <= MemoryLayout.size(ofValue: addr.sun_path) else { return false }
+        withUnsafeMutablePointer(to: &addr.sun_path) { sunPath in
+            sunPath.withMemoryRebound(to: CChar.self, capacity: pathBytes.count) { dst in
+                pathBytes.withUnsafeBufferPointer { src in dst.update(from: src.baseAddress!, count: pathBytes.count) }
+            }
+        }
+        let size = socklen_t(MemoryLayout<sockaddr_un>.size)
+        let result = withUnsafePointer(to: &addr) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, size) }
+        }
+        return result == 0
     }
 
     /// The input device name to pin the daemon to, matching the user's mic choice (built-in by
@@ -161,6 +187,16 @@ final class ParakeetManager: ObservableObject {
                // Only signal it if it's actually our parakeet binary.
                processPath(pid) == binary.path {
                 kill(pid, SIGTERM)
+                // Wait briefly for graceful exit, then force-kill: a daemon that ignores SIGTERM
+                // would otherwise keep the mic/socket and race (or double-paste with) the fresh
+                // one we're about to start. The fresh start polls for accept readiness, so this
+                // ~150 ms one-time wait on a rare orphan path is acceptable.
+                var alive = true
+                for _ in 0 ..< 15 {
+                    if kill(pid, 0) != 0 { alive = false; break }   // ESRCH → gone
+                    usleep(10_000)
+                }
+                if alive { kill(pid, SIGKILL) }
             }
             try? fm.removeItem(at: pidFile)
         }
@@ -237,21 +273,33 @@ final class ParakeetManager: ObservableObject {
 
     // MARK: - Subprocess helpers
 
-    /// Run a process to completion; throws on non-zero exit. stdout/stderr are discarded.
+    /// Run a process to completion; throws on non-zero exit. stdout is discarded; stderr is
+    /// captured so a clone/build failure (cargo/git error) is diagnosable in the log.
     private func run(_ launchPath: String, _ args: [String], cwd: URL? = nil) async throws {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: launchPath)
         process.arguments = args
         if let cwd { process.currentDirectoryURL = cwd }
         process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
+        // stderr → a file (not /dev/null): cargo/git write the real failure there. A file avoids
+        // the pipe-buffer deadlock a live reader could hit on a large build log.
+        let errLog = support.appendingPathComponent("setup-stderr.log")
+        try? fm.removeItem(at: errLog)
+        fm.createFile(atPath: errLog.path, contents: nil)
+        let errHandle = try? FileHandle(forWritingTo: errLog)
+        process.standardError = errHandle ?? FileHandle.nullDevice
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-            process.terminationHandler = { proc in
-                proc.terminationStatus == 0
-                    ? cont.resume()
-                    : cont.resume(throwing: ParakeetError.commandFailed(launchPath, Int(proc.terminationStatus)))
+            process.terminationHandler = { [errLog] proc in
+                try? errHandle?.close()
+                if proc.terminationStatus == 0 {
+                    cont.resume()
+                } else {
+                    let tail = String((try? String(contentsOf: errLog, encoding: .utf8))?.suffix(2000) ?? "")
+                    Diag.conn.error("\((launchPath as NSString).lastPathComponent) failed (\(proc.terminationStatus)): \(tail, privacy: .public)")
+                    cont.resume(throwing: ParakeetError.commandFailed(launchPath, Int(proc.terminationStatus)))
+                }
             }
-            do { try process.run() } catch { cont.resume(throwing: error) }
+            do { try process.run() } catch { try? errHandle?.close(); cont.resume(throwing: error) }
         }
     }
 
