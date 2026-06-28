@@ -243,6 +243,9 @@ struct SettingsView: View {
                     .font(.system(size: 12, design: .monospaced))
                     .frame(height: 90)
                     .overlay(RoundedRectangle(cornerRadius: 6).stroke(.secondary.opacity(0.3)))
+                    // Persist on every edit, like every other field here. Otherwise keyterms
+                    // typed without then pressing "Save & Verify" are silently lost on close.
+                    .onChange(of: keyterms) { _, v in AppConfig.saveKeytermsRaw(v) }
             }
 
             Section("AI cleanup") {
@@ -270,7 +273,9 @@ struct SettingsView: View {
                                 Text("Region")
                                 TextField("us-central1", text: $vertexRegion)
                                     .textFieldStyle(.roundedBorder)
-                                    .onSubmit { AppConfig.vertexRegion = vertexRegion }
+                                    // Persist on every edit, not only on Return — a Tab-away or
+                                    // window close after editing must not drop the region.
+                                    .onChange(of: vertexRegion) { _, v in AppConfig.vertexRegion = v }
                             }
                         }
                     }

@@ -10,7 +10,7 @@ if let bundleID = Bundle.main.bundleIdentifier {
     let me = ProcessInfo.processInfo.processIdentifier
     let existing = NSRunningApplication
         .runningApplications(withBundleIdentifier: bundleID)
-        .first { $0.processIdentifier != me }
+        .first { $0.processIdentifier != me && !$0.isTerminated }
     if let existing {
         _ = existing.activate()
         exit(0)
