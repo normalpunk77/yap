@@ -30,6 +30,17 @@ final class ParakeetController {
         recording ? await stop() : await start()
     }
 
+    /// Abandon an in-flight session WITHOUT delivering — used when the provider is changed under
+    /// us, so a recording started on the local engine isn't left orphaned. Safe when idle.
+    func cancel() async {
+        pollTask?.cancel()
+        pollTask = nil
+        guard recording else { return }
+        recording = false
+        onRecording?(false)               // drops the aura + ends the dictation activity
+        manager.sendDaemonCommand("stop")  // tell the daemon to stop capturing; we discard the result
+    }
+
     func shutdown() { manager.stopDaemon() }
 
     private func start() async {

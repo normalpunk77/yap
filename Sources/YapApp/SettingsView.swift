@@ -195,6 +195,9 @@ struct SettingsView: View {
                 }
                 .pickerStyle(.segmented)
                 .onChange(of: provider) { _, newValue in
+                    // Abandon any session still running on the previous engine before the hotkey
+                    // route changes under it (otherwise: orphaned session, aura stuck, Mac awake).
+                    DictationBridge.cancelActiveSession()
                     // Switch keys live: persist the selection and load that provider's key.
                     AppConfig.provider = newValue
                     apiKey = APIKeyStore.loadAPIKey(for: newValue) ?? ""

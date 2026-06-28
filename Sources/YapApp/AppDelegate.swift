@@ -151,6 +151,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         }
         // Let Settings (re)bind the shortcut and learn whether it took.
         HotKeyBridge.apply = { [weak self] shortcut in self?.applyHotKey(shortcut) ?? false }
+        // Let Settings cancel an in-flight dictation when the provider changes, so a session on
+        // the old engine isn't orphaned (aura stuck on, Mac kept awake).
+        DictationBridge.cancelActiveSession = { [weak self] in self?.cancelActiveDictation() }
 
         // Register for Accessibility on launch so Yap shows up in System Settings →
         // Privacy → Accessibility (un-toggled) the moment it's installed — the user can
@@ -193,6 +196,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             let processor = self.makePostProcessor()
             let finalText = await PostProcessRunner.run(text, with: processor)
             Paster.pasteAtCursor(finalText)
+        }
+    }
+
+    /// Abandon any in-flight dictation on BOTH engines (cloud cancel resets to `.idle` → aura off,
+    /// activity ended; local cancel stops the daemon capture). Called when the provider changes so
+    /// the session that was running on the previous engine isn't left orphaned. Both are no-ops
+    /// when idle.
+    private func cancelActiveDictation() {
+        Task { @MainActor in
+            await self.controller.cancel()
+            await self.parakeetController.cancel()
         }
     }
 

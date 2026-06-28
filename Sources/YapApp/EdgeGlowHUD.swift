@@ -38,6 +38,21 @@ enum EdgeGlowLayout {
 final class EdgeGlowHUD {
     private var panel: NSPanel?
     private let model = EdgeGlowModel()
+    private var screenObserver: NSObjectProtocol?
+
+    init() {
+        // Reposition when the display layout changes (monitor unplugged, lid closed, resolution
+        // change). Without this, the panel — placed once when the glow first appeared — stays on
+        // a now-gone screen and the aura is invisible for the rest of the session.
+        screenObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, self.model.active else { return }
+                self.positionOnActiveScreen()
+            }
+        }
+    }
 
     func show(voiceReactive: Bool = true) {
         model.voiceReactive = voiceReactive
@@ -75,8 +90,8 @@ final class EdgeGlowHUD {
     }
 
     private func positionOnActiveScreen() {
-        guard let panel else { return }
-        let frame = Self.activeScreen().frame
+        guard let panel, let screen = Self.activeScreen() else { return }
+        let frame = screen.frame
         panel.setFrame(
             NSRect(x: frame.minX, y: frame.minY, width: frame.width, height: EdgeGlowLayout.panelHeight),
             display: true
@@ -84,12 +99,13 @@ final class EdgeGlowHUD {
     }
 
     /// The screen the user is working on: the one containing the mouse cursor, falling
-    /// back to the key-window screen. Robust across multiple monitors.
-    private static func activeScreen() -> NSScreen {
+    /// back to the key-window screen, then any attached screen. Nil only when there is NO
+    /// display attached (mid-reconfiguration) — callers skip positioning rather than crash.
+    private static func activeScreen() -> NSScreen? {
         let mouse = NSEvent.mouseLocation
         return NSScreen.screens.first { $0.frame.contains(mouse) }
             ?? NSScreen.main
-            ?? NSScreen.screens[0]
+            ?? NSScreen.screens.first
     }
 
     private func makePanel() -> NSPanel {
