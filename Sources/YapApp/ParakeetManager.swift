@@ -352,7 +352,11 @@ final class ParakeetManager: ObservableObject {
                 throw ParakeetError.commandFailed(launchPath, Int(process.terminationStatus))
             }
         } onCancel: {
+            // Cancellation skips the normal-path close above — close the pipe read end and the
+            // log handle here too, or each cancelled download leaks file descriptors.
             process.terminate()
+            try? errHandle?.close()
+            try? pipe.fileHandleForReading.close()
         }
     }
 

@@ -45,9 +45,12 @@ final class ParakeetController {
 
     private func start() async {
         // Cancel any clipboard poller still running from a previous stop() (e.g. a silent
-        // session waiting out its timeout) so it can't deliver into this new dictation.
-        pollTask?.cancel()
+        // session waiting out its timeout) and AWAIT its exit, so it can't deliver into this new
+        // dictation in the narrow window between its cancel and its next cancellation check.
+        let oldPoll = pollTask
         pollTask = nil
+        oldPoll?.cancel()
+        await oldPoll?.value
         guard manager.isReady else {
             onError?("Parakeet isn't set up yet. Open Settings → Parakeet and let it finish building and downloading the model.")
             return
