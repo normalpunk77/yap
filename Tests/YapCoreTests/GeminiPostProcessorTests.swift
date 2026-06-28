@@ -7,9 +7,11 @@ final class GeminiPostProcessorTests: XCTestCase {
     func testApiKeyPathHitsCorrectURLAndReturnsCleanText() async throws {
         var seenURL: URL?
         var seenAuthHeader: String?
+        var seenKeyHeader: String?
         MockURLProtocol.handler = { req in
             seenURL = req.url
             seenAuthHeader = req.value(forHTTPHeaderField: "Authorization")
+            seenKeyHeader = req.value(forHTTPHeaderField: "x-goog-api-key")
             let body = #"{"candidates":[{"content":{"parts":[{"text":"Hello, world."}]}}]}"#.data(using: .utf8)!
             return (200, body)
         }
@@ -21,9 +23,12 @@ final class GeminiPostProcessorTests: XCTestCase {
         )
         let out = try await proc.process("hello world")
         XCTAssertEqual(out, "Hello, world.")
+        // The key travels in the x-goog-api-key header, NOT the URL — so it can't leak via
+        // crash reports / proxy logs that capture the failing URL.
         XCTAssertEqual(seenURL?.absoluteString,
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=SECRET")
-        XCTAssertNil(seenAuthHeader)   // API-key path uses the query param, not a Bearer header
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent")
+        XCTAssertEqual(seenKeyHeader, "SECRET")
+        XCTAssertNil(seenAuthHeader)   // API-key path uses the key header, not a Bearer header
     }
 
     func testNon200Throws() async {

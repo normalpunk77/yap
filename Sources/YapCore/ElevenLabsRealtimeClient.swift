@@ -51,7 +51,18 @@ public final class ElevenLabsRealtimeClient: TranscriptionClient, @unchecked Sen
                             Diag.conn.error("ElevenLabs: empty inbound frame → server closed the stream")
                             continuation.yield(.failed(.socketClosed)); break
                         }
-                        switch try ElevenLabsResponse.decode(data, decoder: decoder) {
+                        // A frame we can't decode (missing `message_type`, an unknown shape, or a
+                        // brand-new server message during an API rollout) is ONE bad message, not a
+                        // reason to abort the whole dictation — skip it and keep listening. Real API
+                        // errors arrive as the decoded `.error` case below and still propagate.
+                        let parsed: ElevenLabsResponse
+                        do {
+                            parsed = try ElevenLabsResponse.decode(data, decoder: decoder)
+                        } catch {
+                            Diag.conn.error("ElevenLabs: skipping undecodable frame: \(Diag.describe(error), privacy: .public)")
+                            continue
+                        }
+                        switch parsed {
                         case .partial(let t): continuation.yield(.partial(t))
                         case .committed(let t): continuation.yield(.committed(t))
                         case .error(let e): continuation.yield(.failed(e))

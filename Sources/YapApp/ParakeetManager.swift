@@ -147,11 +147,23 @@ final class ParakeetManager: ObservableObject {
     private func terminateOrphanedDaemon() {
         for pidFile in [pidURL, defaultPidURL] {
             if let contents = try? String(contentsOf: pidFile, encoding: .utf8),
-               let pid = Int32(contents.trimmingCharacters(in: .whitespacesAndNewlines)), pid > 0 {
+               let pid = Int32(contents.trimmingCharacters(in: .whitespacesAndNewlines)), pid > 0,
+               // macOS recycles PIDs: a stale pid file may now point at an UNRELATED process.
+               // Only signal it if it's actually our parakeet binary.
+               processPath(pid) == binary.path {
                 kill(pid, SIGTERM)
             }
             try? fm.removeItem(at: pidFile)
         }
+    }
+
+    /// The executable path of the process at `pid`, or nil if it can't be read (gone, or not
+    /// ours). Used to confirm a pid-file entry is really our daemon before signalling it.
+    private func processPath(_ pid: Int32) -> String? {
+        var buffer = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+        let length = proc_pidpath(pid, &buffer, UInt32(buffer.count))
+        guard length > 0 else { return nil }
+        return String(decoding: buffer.prefix(Int(length)).map { UInt8(bitPattern: $0) }, as: UTF8.self)
     }
 
     /// Send a one-word control command (start/stop/toggle/shutdown) to the daemon socket.
@@ -167,6 +179,9 @@ final class ParakeetManager: ObservableObject {
         guard (try? nc.run()) != nil else { return }
         input.fileHandleForWriting.write(Data("\(command)\n".utf8))
         try? input.fileHandleForWriting.close()
+        // Reap the `nc` child once it exits, so repeated start/stop cycles don't pile up
+        // zombie processes (its output goes to /dev/null, so it never blocks on a reader).
+        DispatchQueue.global(qos: .utility).async { nc.waitUntilExit() }
     }
 
     func stopDaemon() {

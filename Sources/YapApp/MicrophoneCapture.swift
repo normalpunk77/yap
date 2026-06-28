@@ -194,7 +194,7 @@ final class MicrophoneCapture: AudioCapturer, @unchecked Sendable {
             if fed { status.pointee = .noDataNow; return nil }
             fed = true; status.pointee = .haveData; return buffer
         }
-        guard error == nil, let ch = out.floatChannelData else { return nil }
+        guard error == nil, out.frameLength > 0, let ch = out.floatChannelData else { return nil }
         return Array(UnsafeBufferPointer(start: ch[0], count: Int(out.frameLength)))
     }
 

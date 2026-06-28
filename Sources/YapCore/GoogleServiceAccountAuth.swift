@@ -37,6 +37,10 @@ public actor GoogleServiceAccountAuth {
 
     private var cachedToken: String?
     private var expiry: Date = .distantPast
+    /// The in-flight mint, if one is already running. A second caller arriving during the token
+    /// exchange (the actor is released at the network `await`) awaits THIS instead of starting a
+    /// second JWT-bearer exchange — one token per refresh, not one per concurrent caller.
+    private var inflight: Task<String, Error>?
 
     public init(account: ServiceAccount,
                 session: URLSession = .shared,
@@ -48,6 +52,14 @@ public actor GoogleServiceAccountAuth {
 
     public func accessToken() async throws -> String {
         if let cachedToken, now() < expiry.addingTimeInterval(-60) { return cachedToken }
+        if let inflight { return try await inflight.value }
+        let task = Task { try await mintToken() }
+        inflight = task
+        defer { inflight = nil }
+        return try await task.value
+    }
+
+    private func mintToken() async throws -> String {
         let jwt = try makeJWT()
         var req = URLRequest(url: URL(string: "https://oauth2.googleapis.com/token")!)
         req.httpMethod = "POST"

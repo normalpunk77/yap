@@ -40,9 +40,13 @@ public struct GeminiPostProcessor: TextPostProcessor {
         let body = try GeminiWire.requestBody(prompt: prompt, transcript: transcript)
         switch auth {
         case .apiKey(let key):
+            // Pass the key as a header, NOT a `?key=` query param: a URL with the key embedded
+            // leaks into crash reports (NSURLErrorFailingURLStringErrorKey) and proxy logs.
             let url = URL(string:
-                "https://generativelanguage.googleapis.com/v1beta/models/\(model.rawValue):generateContent?key=\(key)")!
-            return jsonPOST(url, body: body)
+                "https://generativelanguage.googleapis.com/v1beta/models/\(model.rawValue):generateContent")!
+            var req = jsonPOST(url, body: body)
+            req.setValue(key, forHTTPHeaderField: "x-goog-api-key")
+            return req
         case .vertex(let token, let project, let region):
             let url = URL(string:
                 "https://\(region)-aiplatform.googleapis.com/v1/projects/\(project)/locations/\(region)/publishers/google/models/\(model.rawValue):generateContent")!

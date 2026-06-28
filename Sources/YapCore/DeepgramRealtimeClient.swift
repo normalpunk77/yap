@@ -41,7 +41,17 @@ public final class DeepgramRealtimeClient: TranscriptionClient, @unchecked Senda
                             Diag.conn.error("Deepgram: empty inbound frame → server closed the stream")
                             continuation.yield(.failed(.socketClosed)); break
                         }
-                        switch try DeepgramResponse.decode(data, decoder: decoder) {
+                        // An undecodable frame is a single bad/unknown message, NOT a dead
+                        // socket — skip it and keep listening. (Routing it to the generic catch
+                        // below mislabeled it `.socketClosed`, triggering a pointless reconnect.)
+                        let parsed: DeepgramResponse
+                        do {
+                            parsed = try DeepgramResponse.decode(data, decoder: decoder)
+                        } catch {
+                            Diag.conn.error("Deepgram: skipping undecodable frame: \(Diag.describe(error), privacy: .public)")
+                            continue
+                        }
+                        switch parsed {
                         case .partial(let t): continuation.yield(.partial(t))
                         case .committed(let t): continuation.yield(.committed(t))
                         case .ignored: continue

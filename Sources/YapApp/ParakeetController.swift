@@ -9,6 +9,10 @@ import YapCore
 final class ParakeetController {
     private let manager = ParakeetManager.shared
     private var recording = false
+    /// The in-flight clipboard-polling task from the current `stop()`. Held so a new `start()`
+    /// can cancel it — otherwise a stale poller from a previous (e.g. silent) session could fire
+    /// `onText` into the NEXT dictation, pasting the wrong transcript.
+    private var pollTask: Task<Void, Never>?
 
     /// Whether a recording session is currently active (so the hotkey path can skip the
     /// microphone gate when the press is a stop, not a start).
@@ -29,6 +33,10 @@ final class ParakeetController {
     func shutdown() { manager.stopDaemon() }
 
     private func start() async {
+        // Cancel any clipboard poller still running from a previous stop() (e.g. a silent
+        // session waiting out its timeout) so it can't deliver into this new dictation.
+        pollTask?.cancel()
+        pollTask = nil
         guard manager.isReady else {
             onError?("Parakeet isn't set up yet. Open Settings → Parakeet and let it finish building and downloading the model.")
             return
@@ -54,17 +62,28 @@ final class ParakeetController {
         // whether any speech was captured. Otherwise a press-without-speaking left the aura lit
         // for the whole no-speech timeout below.
         onRecording?(false)
-        let clipboardBefore = NSPasteboard.general.changeCount
+        let pb = NSPasteboard.general
+        let countBefore = pb.changeCount
+        let textBefore = pb.string(forType: .string)
         manager.sendDaemonCommand("stop")
-        // The daemon transcribes (~0.5 s) then copies the text to the clipboard. Paste it as
-        // soon as it lands; give up after a few seconds (no speech / silence).
-        for _ in 0 ..< 120 {
-            try? await Task.sleep(nanoseconds: 50_000_000)   // 50 ms × 120 ≈ 6 s
-            if NSPasteboard.general.changeCount != clipboardBefore {
-                let text = NSPasteboard.general.string(forType: .string) ?? ""
-                if !text.isEmpty { onText?(text) }
-                return
+        // The daemon transcribes (~0.5 s) then copies the text to the clipboard. Poll for it in a
+        // cancellable task so a fresh start() can abandon this wait. Give up after ~6 s (silence).
+        let task = Task { [weak self] in
+            for _ in 0 ..< 120 {
+                try? await Task.sleep(nanoseconds: 50_000_000)   // 50 ms × 120 ≈ 6 s
+                if Task.isCancelled { return }
+                guard pb.changeCount != countBefore else { continue }
+                let text = pb.string(forType: .string) ?? ""
+                // Only deliver a genuinely NEW, non-empty transcript. A change-count bump whose
+                // contents match what was already on the clipboard — or are empty — is another
+                // app's write (or a no-op), not the daemon's transcript: keep waiting.
+                if !text.isEmpty, text != textBefore {
+                    self?.onText?(text)
+                    return
+                }
             }
         }
+        pollTask = task
+        await task.value
     }
 }
