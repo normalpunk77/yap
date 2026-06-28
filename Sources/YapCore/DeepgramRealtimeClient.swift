@@ -61,8 +61,13 @@ public final class DeepgramRealtimeClient: TranscriptionClient, @unchecked Senda
                     Diag.conn.error("Deepgram stream error: \(String(describing: e), privacy: .public)")
                     continuation.yield(.failed(e))
                 } catch {
-                    Diag.conn.error("Deepgram socket dropped: \(Diag.describe(error), privacy: .public)")
-                    continuation.yield(.failed(.socketClosed))
+                    // A cancellation (we're tearing the session down / reconnecting) is NOT a
+                    // dropped socket — yielding .socketClosed here would trigger a spurious
+                    // reconnect. Stay silent and just end the stream.
+                    if !Task.isCancelled {
+                        Diag.conn.error("Deepgram socket dropped: \(Diag.describe(error), privacy: .public)")
+                        continuation.yield(.failed(.socketClosed))
+                    }
                 }
                 continuation.finish()
             }

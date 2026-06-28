@@ -190,7 +190,11 @@ final class MicrophoneCapture: AudioCapturer, @unchecked Sendable {
         // Bluetooth route switch), so it always matches the buffers we receive.
         if let existing = converter,
            existing.inputFormat.sampleRate == buffer.format.sampleRate,
-           existing.inputFormat.channelCount == buffer.format.channelCount {
+           existing.inputFormat.channelCount == buffer.format.channelCount,
+           // Also match the sample TYPE: a device swap (USB) can deliver Int16/Int32 instead of
+           // Float32 at the same rate/channels — a converter built for the old type would garble
+           // or drop the audio.
+           existing.inputFormat.commonFormat == buffer.format.commonFormat {
             // reuse
         } else {
             let made = AVAudioConverter(from: buffer.format, to: targetFormat)
