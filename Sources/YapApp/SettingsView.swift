@@ -195,6 +195,9 @@ struct SettingsView: View {
                 }
                 .pickerStyle(.segmented)
                 .onChange(of: provider) { _, newValue in
+                    // Abandon any session still running on the previous engine before the hotkey
+                    // route changes under it (otherwise: orphaned session, aura stuck, Mac awake).
+                    DictationBridge.cancelActiveSession()
                     // Switch keys live: persist the selection and load that provider's key.
                     AppConfig.provider = newValue
                     apiKey = APIKeyStore.loadAPIKey(for: newValue) ?? ""
@@ -243,6 +246,9 @@ struct SettingsView: View {
                     .font(.system(size: 12, design: .monospaced))
                     .frame(height: 90)
                     .overlay(RoundedRectangle(cornerRadius: 6).stroke(.secondary.opacity(0.3)))
+                    // Persist on every edit, like every other field here. Otherwise keyterms
+                    // typed without then pressing "Save & Verify" are silently lost on close.
+                    .onChange(of: keyterms) { _, v in AppConfig.saveKeytermsRaw(v) }
             }
 
             Section("AI cleanup") {
@@ -270,7 +276,12 @@ struct SettingsView: View {
                                 Text("Region")
                                 TextField("us-central1", text: $vertexRegion)
                                     .textFieldStyle(.roundedBorder)
-                                    .onSubmit { AppConfig.vertexRegion = vertexRegion }
+                                    // Persist on every edit, not only on Return — a Tab-away or
+                                    // window close after editing must not drop the region. Trim so a
+                                    // stray space/newline can't later break the Vertex URL.
+                                    .onChange(of: vertexRegion) { _, v in
+                                        AppConfig.vertexRegion = v.trimmingCharacters(in: .whitespacesAndNewlines)
+                                    }
                             }
                         }
                     }
@@ -302,7 +313,7 @@ struct SettingsView: View {
             }
 
             Section {
-                Text("Hotkey: ⌥S (Option+S) to start / stop dictation.")
+                Text("Hotkey: \(hotKey.display) to start / stop dictation.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -428,7 +439,7 @@ struct SettingsView: View {
         AppConfig.postProcessModel = ppModel
         AppConfig.postProcessPrompt = ppPrompt
         AppConfig.vertexProject = vertexProject
-        AppConfig.vertexRegion = vertexRegion
+        AppConfig.vertexRegion = vertexRegion.trimmingCharacters(in: .whitespacesAndNewlines)
         if ppAuth == .apiKey { LLMCredentialStore.saveGeminiAPIKey(geminiKey) }
         ppStatus = "Verifying…"
         let settings = AppConfig.postProcessSettings()

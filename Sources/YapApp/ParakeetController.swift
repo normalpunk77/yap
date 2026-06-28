@@ -26,6 +26,10 @@ final class ParakeetController {
     private let clipboard: ClipboardReading
     private var recording = false
     private var starting = false
+    /// The in-flight clipboard-polling task from the current `stop()`. Held so a new `start()`
+    /// can cancel it — otherwise a stale poller from a previous (e.g. silent) session could fire
+    /// `onText` into the NEXT dictation, pasting the wrong transcript.
+    private var pollTask: Task<Void, Never>?
 
     init(manager: ParakeetManaging = ParakeetManager.shared,
          clipboard: ClipboardReading = NSPasteboard.general) {
@@ -50,11 +54,29 @@ final class ParakeetController {
         recording ? await stop() : await start()
     }
 
+    /// Abandon an in-flight session WITHOUT delivering — used when the provider is changed under
+    /// us, so a recording started on the local engine isn't left orphaned. Safe when idle.
+    func cancel() async {
+        pollTask?.cancel()
+        pollTask = nil
+        guard recording else { return }
+        recording = false
+        onRecording?(false)                    // drops the aura + ends the dictation activity
+        _ = manager.sendDaemonCommand("stop")  // tell the daemon to stop capturing; discard result
+    }
+
     func shutdown() { manager.stopDaemon() }
 
     private func start() async {
         starting = true
         defer { starting = false }
+        // Cancel any clipboard poller still running from a previous stop() (e.g. a silent
+        // session waiting out its timeout) and AWAIT its exit, so it can't deliver into this new
+        // dictation in the narrow window between its cancel and its next cancellation check.
+        let oldPoll = pollTask
+        pollTask = nil
+        oldPoll?.cancel()
+        await oldPoll?.value
         guard manager.isReady else {
             onError?("Parakeet isn't set up yet. Open Settings → Parakeet and let it finish building and downloading the model.")
             return
@@ -85,25 +107,36 @@ final class ParakeetController {
         // whether any speech was captured. Otherwise a press-without-speaking left the aura lit
         // for the whole no-speech timeout below.
         onRecording?(false)
-        let clipboardBefore = clipboard.changeCount
+        let countBefore = clipboard.changeCount
         guard manager.sendDaemonCommand("stop") else {
             onError?("The local engine failed to stop recording.")
             return
         }
-        if clipboard.changeCount != clipboardBefore {
-            let text = clipboard.string(forType: .string) ?? ""
-            if !text.isEmpty { onText?(text) }
-            return
-        }
-        // The daemon transcribes (~0.5 s) then copies the text to the clipboard. Paste it as
-        // soon as it lands; give up after a few seconds (no speech / silence).
-        for _ in 0 ..< 120 {
-            try? await Task.sleep(nanoseconds: 50_000_000)   // 50 ms × 120 ≈ 6 s
-            if clipboard.changeCount != clipboardBefore {
-                let text = clipboard.string(forType: .string) ?? ""
-                if !text.isEmpty { onText?(text) }
-                return
+        // The daemon transcribes (~0.5 s) then copies the text to the clipboard. Poll for it in a
+        // cancellable task so a fresh start() can abandon this wait. Give up after ~6 s (silence).
+        let task = Task { [weak self] in
+            for _ in 0 ..< 120 {
+                if Task.isCancelled { return }
+                if let self, self.clipboard.changeCount != countBefore {
+                    let text = self.clipboard.string(forType: .string) ?? ""
+                    // A change-count bump after we sent "stop" is the daemon's transcript copy.
+                    // Deliver the first non-empty result. Do NOT also require it to differ from the
+                    // prior clipboard: a legitimately repeated dictation ("ok" then "ok") copies the
+                    // SAME string and must still be delivered, not dropped as a duplicate.
+                    if !text.isEmpty {
+                        if Task.isCancelled { return }   // a fresh start() may have cancelled us
+                        // The daemon left the RAW transcript on the clipboard. Clear it before
+                        // delivery so the paste path's restore doesn't put that raw text back —
+                        // otherwise a later ⌘V would yield the un-cleaned transcript.
+                        NSPasteboard.general.clearContents()
+                        self.onText?(text)
+                        return
+                    }
+                }
+                try? await Task.sleep(nanoseconds: 50_000_000)   // 50 ms × 120 ≈ 6 s
             }
         }
+        pollTask = task
+        await task.value
     }
 }

@@ -25,7 +25,8 @@ enum LLMCredentialStore {
         guard !trimmed.isEmpty else { return }   // empty = cleared
         var add = base
         add[kSecValueData as String] = Data(trimmed.utf8)
-        add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
+        // Foreground dictation app: no need to reach the secret while the screen is locked.
+        add[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlocked
         SecItemAdd(add as CFDictionary, nil)
     }
 

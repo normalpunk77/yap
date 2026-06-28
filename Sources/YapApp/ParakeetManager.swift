@@ -50,16 +50,38 @@ final class ParakeetManager: ObservableObject, ParakeetManaging {
     /// The built binary's path, or nil if it isn't built yet.
     var binaryPath: String? { fm.isExecutableFile(atPath: binary.path) ? binary.path : nil }
     var modelDirPath: String { modelDir.path }
-    /// True when both the binary and the model are present — ready to transcribe.
+    /// True when both the binary and a COMPLETE model are present — ready to transcribe.
     var isReady: Bool {
-        binaryPath != nil && fm.fileExists(atPath: modelDir.appendingPathComponent("config.json").path)
+        binaryPath != nil && modelDownloaded
+    }
+
+    /// A model download is complete only when BOTH the small config and the large encoder
+    /// weights are present. Gating on `config.json` alone declared a download interrupted after
+    /// the config (but before the multi-hundred-MB encoder) as "ready" — the daemon then failed
+    /// to load the model at start instead of resuming the download.
+    private var modelDownloaded: Bool {
+        fm.fileExists(atPath: modelDir.appendingPathComponent("config.json").path)
+            && fm.fileExists(atPath: modelDir.appendingPathComponent("encoder-model.int8.onnx").path)
     }
 
     /// Build (if needed) and download (if needed) so the engine is ready. Idempotent: returns
     /// immediately when already set up. Runs the heavy steps as child processes, surfacing the
     /// real download progress.
+    private var setupTask: Task<Void, Never>?
+
     func ensureReady() async {
         if isReady { phase = .ready; return }
+        // Coalesce concurrent setups: a second tap (e.g. a Retry double-click) while a build or
+        // download is already in flight must NOT spawn a second cargo build / downloader writing
+        // the same files. Both callers await the one in-flight task.
+        if let setupTask { return await setupTask.value }
+        let task = Task { await runSetup() }
+        setupTask = task
+        defer { setupTask = nil }
+        await task.value
+    }
+
+    private func runSetup() async {
         do {
             try await buildBinaryIfNeeded()
             try await downloadModelIfNeeded()
@@ -82,7 +104,7 @@ final class ParakeetManager: ObservableObject, ParakeetManaging {
         // A daemon orphaned by a previous session (force-quit, crash) keeps running and leaves
         // its pid file behind; the binary then refuses to start ("PID file ... File exists").
         // Kill the orphan and clear the stale pid + socket before launching a fresh one.
-        terminateOrphanedDaemon()
+        await terminateOrphanedDaemon()
         try? fm.removeItem(at: socketURL)
         let process = Process()
         process.executableURL = URL(fileURLWithPath: bin)
@@ -125,14 +147,22 @@ final class ParakeetManager: ObservableObject, ParakeetManaging {
         // failure fast instead of waiting out the whole timeout.
         for _ in 0 ..< 600 {
             if !process.isRunning { throw ParakeetError.daemonDidNotStart }
-            if fm.fileExists(atPath: socketURL.path),
-               let fd = connectUnixSocket(path: socketURL.path) {
-                close(fd)
-                return
-            }
+            // Probe an actual connect(), not just that the socket FILE exists: the file appears
+            // at bind() but the daemon only accepts after listen() — a `start` sent in that gap
+            // can be dropped. connect() succeeds only once it's truly accepting.
+            if daemonAccepting() { return }
             try await Task.sleep(nanoseconds: 50_000_000)
         }
         throw ParakeetError.daemonDidNotStart
+    }
+
+    /// True when a SOCK_STREAM connect to the daemon's Unix socket succeeds — i.e. it's actually
+    /// accepting commands. More reliable than checking for the socket file, which exists from
+    /// bind() onward (before listen()/accept()). Reuses the same connect helper as command sends.
+    private func daemonAccepting() -> Bool {
+        guard let fd = connectUnixSocket(path: socketURL.path) else { return false }
+        close(fd)
+        return true
     }
 
     /// The input device name to pin the daemon to, matching the user's mic choice (built-in by
@@ -149,14 +179,38 @@ final class ParakeetManager: ObservableObject, ParakeetManaging {
     /// Terminate a daemon left running by a previous session and remove its pid file (both the
     /// path we pass now and the binary's default, for daemons older builds started). Without
     /// this, the leftover pid file makes every new daemon refuse to start.
-    private func terminateOrphanedDaemon() {
+    private func terminateOrphanedDaemon() async {
         for pidFile in [pidURL, defaultPidURL] {
             if let contents = try? String(contentsOf: pidFile, encoding: .utf8),
-               let pid = Int32(contents.trimmingCharacters(in: .whitespacesAndNewlines)), pid > 0 {
+               let pid = Int32(contents.trimmingCharacters(in: .whitespacesAndNewlines)), pid > 0,
+               // macOS recycles PIDs: a stale pid file may now point at an UNRELATED process.
+               // Only signal it if it's actually our parakeet binary.
+               processPath(pid) == binary.path {
                 kill(pid, SIGTERM)
+                // Wait briefly for graceful exit, then force-kill: a daemon that ignores SIGTERM
+                // would otherwise keep the mic/socket and race (or double-paste with) the fresh
+                // one we're about to start. Async sleep (not usleep) so this rare orphan path
+                // doesn't block the main thread.
+                var alive = true
+                for _ in 0 ..< 15 {
+                    if kill(pid, 0) != 0 { alive = false; break }   // ESRCH → gone
+                    try? await Task.sleep(nanoseconds: 10_000_000)   // 10 ms × 15 ≈ 150 ms
+                }
+                // Re-verify identity before the harder kill: the PID could have been recycled to
+                // an unrelated process while we waited.
+                if alive, processPath(pid) == binary.path { kill(pid, SIGKILL) }
             }
             try? fm.removeItem(at: pidFile)
         }
+    }
+
+    /// The executable path of the process at `pid`, or nil if it can't be read (gone, or not
+    /// ours). Used to confirm a pid-file entry is really our daemon before signalling it.
+    private func processPath(_ pid: Int32) -> String? {
+        var buffer = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+        let length = proc_pidpath(pid, &buffer, UInt32(buffer.count))
+        guard length > 0 else { return nil }
+        return String(decoding: buffer.prefix(Int(length)).map { UInt8(bitPattern: $0) }, as: UTF8.self)
     }
 
     /// Send a one-word control command (start/stop/toggle/shutdown) to the daemon socket.
@@ -184,6 +238,8 @@ final class ParakeetManager: ObservableObject, ParakeetManaging {
         return writtenAll
     }
 
+    /// Connect a SOCK_STREAM Unix socket to `path`, returning the fd (caller closes it) or nil.
+    /// SO_NOSIGPIPE so a write to a vanished daemon fails with EPIPE instead of killing the app.
     private func connectUnixSocket(path: String) -> Int32? {
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { return nil }
@@ -264,7 +320,7 @@ final class ParakeetManager: ObservableObject, ParakeetManaging {
     // MARK: - Download
 
     private func downloadModelIfNeeded() async throws {
-        guard !fm.fileExists(atPath: modelDir.appendingPathComponent("config.json").path) else { return }
+        guard !modelDownloaded else { return }
         guard let bin = binaryPath else { throw ParakeetError.buildProducedNoBinary }
         try fm.createDirectory(at: modelDir, withIntermediateDirectories: true)
         try await runStreaming(bin, ["download", "--model-dir", modelDir.path, "--progress", "json"]) { [weak self] prog in
@@ -274,21 +330,33 @@ final class ParakeetManager: ObservableObject, ParakeetManaging {
 
     // MARK: - Subprocess helpers
 
-    /// Run a process to completion; throws on non-zero exit. stdout/stderr are discarded.
+    /// Run a process to completion; throws on non-zero exit. stdout is discarded; stderr is
+    /// captured so a clone/build failure (cargo/git error) is diagnosable in the log.
     private func run(_ launchPath: String, _ args: [String], cwd: URL? = nil) async throws {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: launchPath)
         process.arguments = args
         if let cwd { process.currentDirectoryURL = cwd }
         process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
+        // stderr → a file (not /dev/null): cargo/git write the real failure there. A file avoids
+        // the pipe-buffer deadlock a live reader could hit on a large build log.
+        let errLog = support.appendingPathComponent("setup-stderr.log")
+        try? fm.removeItem(at: errLog)
+        fm.createFile(atPath: errLog.path, contents: nil)
+        let errHandle = try? FileHandle(forWritingTo: errLog)
+        process.standardError = errHandle ?? FileHandle.nullDevice
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-            process.terminationHandler = { proc in
-                proc.terminationStatus == 0
-                    ? cont.resume()
-                    : cont.resume(throwing: ParakeetError.commandFailed(launchPath, Int(proc.terminationStatus)))
+            process.terminationHandler = { [errLog] proc in
+                try? errHandle?.close()
+                if proc.terminationStatus == 0 {
+                    cont.resume()
+                } else {
+                    let tail = String((try? String(contentsOf: errLog, encoding: .utf8))?.suffix(2000) ?? "")
+                    Diag.conn.error("\((launchPath as NSString).lastPathComponent) failed (\(proc.terminationStatus)): \(tail, privacy: .public)")
+                    cont.resume(throwing: ParakeetError.commandFailed(launchPath, Int(proc.terminationStatus)))
+                }
             }
-            do { try process.run() } catch { cont.resume(throwing: error) }
+            do { try process.run() } catch { try? errHandle?.close(); cont.resume(throwing: error) }
         }
     }
 
@@ -302,17 +370,36 @@ final class ParakeetManager: ObservableObject, ParakeetManaging {
         let decoder = JSONDecoder()
         let pipe = Pipe()
         process.standardOutput = pipe
-        process.standardError = FileHandle.nullDevice
+        // stderr → a file (like run()) so a download failure (network/404/TLS) is diagnosable.
+        let errLog = support.appendingPathComponent("setup-stderr.log")
+        try? fm.removeItem(at: errLog)
+        fm.createFile(atPath: errLog.path, contents: nil)
+        let errHandle = try? FileHandle(forWritingTo: errLog)
+        process.standardError = errHandle ?? FileHandle.nullDevice
         try process.run()
-        for try await line in pipe.fileHandleForReading.bytes.lines {
-            if let event = ParakeetDownloadEvent.parse(line, decoder: decoder),
-               let progress = ParakeetDownloadProgress.from(event) {
-                onProgress(progress)
+        // If the enclosing Task is cancelled (user leaves setup mid-download), terminate the child
+        // so it stops writing the model files — otherwise a later retry races a second downloader
+        // writing the same paths.
+        try await withTaskCancellationHandler {
+            for try await line in pipe.fileHandleForReading.bytes.lines {
+                if let event = ParakeetDownloadEvent.parse(line, decoder: decoder),
+                   let progress = ParakeetDownloadProgress.from(event) {
+                    onProgress(progress)
+                }
             }
-        }
-        process.waitUntilExit()   // stdout hit EOF → the process has finished
-        guard process.terminationStatus == 0 else {
-            throw ParakeetError.commandFailed(launchPath, Int(process.terminationStatus))
+            process.waitUntilExit()   // stdout hit EOF → the process has finished
+            try? errHandle?.close()
+            guard process.terminationStatus == 0 else {
+                let tail = String((try? String(contentsOf: errLog, encoding: .utf8))?.suffix(2000) ?? "")
+                Diag.conn.error("\((launchPath as NSString).lastPathComponent) download failed (\(process.terminationStatus)): \(tail, privacy: .public)")
+                throw ParakeetError.commandFailed(launchPath, Int(process.terminationStatus))
+            }
+        } onCancel: {
+            // Cancellation skips the normal-path close above — close the pipe read end and the
+            // log handle here too, or each cancelled download leaks file descriptors.
+            process.terminate()
+            try? errHandle?.close()
+            try? pipe.fileHandleForReading.close()
         }
     }
 

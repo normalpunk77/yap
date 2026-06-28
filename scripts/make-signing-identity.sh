@@ -35,8 +35,14 @@ CFG
 openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
     -keyout "$TMP/key.pem" -out "$TMP/cert.pem" -config "$TMP/cfg"
 
-# -legacy: macOS `security import` can't verify the PKCS#12 MAC that OpenSSL 3 writes by default.
-openssl pkcs12 -export -legacy -name "$NAME" -passout pass:yap \
+# macOS `security import` can't verify the PKCS#12 MAC that OpenSSL 3 writes by default, so we
+# pass -legacy for OpenSSL. But the SYSTEM openssl is LibreSSL, which doesn't support (or need)
+# -legacy — passing it there makes the script error out on a clean machine. Add it only for OpenSSL.
+LEGACY=""
+if ! openssl version | grep -qi libressl; then
+    LEGACY="-legacy"
+fi
+openssl pkcs12 -export $LEGACY -name "$NAME" -passout pass:yap \
     -inkey "$TMP/key.pem" -in "$TMP/cert.pem" -out "$TMP/id.p12"
 
 # -A lets codesign use the key without a per-build prompt.

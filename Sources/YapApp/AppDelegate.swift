@@ -21,7 +21,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private var controller: DictationController!
     private let parakeetController = ParakeetController()
     private var dictationActivity: NSObjectProtocol?
-    private var didPromptForKey = false
     // Persist the Vertex auth across dictations so its OAuth token cache survives. Rebuilding it
     // per dictation (as `makePostProcessor` did) threw the cache away and re-minted a token every
     // time — a JWT sign + token-exchange round trip to Google that dominated the cleanup latency.
@@ -152,6 +151,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         }
         // Let Settings (re)bind the shortcut and learn whether it took.
         HotKeyBridge.apply = { [weak self] shortcut in self?.applyHotKey(shortcut) ?? false }
+        // Let Settings cancel an in-flight dictation when the provider changes, so a session on
+        // the old engine isn't orphaned (aura stuck on, Mac kept awake).
+        DictationBridge.cancelActiveSession = { [weak self] in self?.cancelActiveDictation() }
 
         // Register for Accessibility on launch so Yap shows up in System Settings →
         // Privacy → Accessibility only when the user actually tries to paste. That avoids an
@@ -206,6 +208,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
                 Paster.pasteAtCursor(finalText)
                 self.deliveryTask = nil
             }
+        }
+    }
+
+    /// Abandon any in-flight dictation on BOTH engines (cloud cancel resets to `.idle` → aura off,
+    /// activity ended; local cancel stops the daemon capture). Called when the provider changes so
+    /// the session that was running on the previous engine isn't left orphaned. Both are no-ops
+    /// when idle.
+    private func cancelActiveDictation() {
+        Task { @MainActor in
+            await self.controller.cancel()
+            await self.parakeetController.cancel()
         }
     }
 
@@ -265,6 +278,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     /// Drive the aura from a real mic level meter during Parakeet dictation. The daemon owns the
     /// transcription mic in another process; this independent tap exists only to give the aura
     /// the user's voice. Best-effort: on failure the aura keeps self-breathing.
+    /// Serializes meter start/stop on ONE chain so they never overlap on the shared capturer.
+    /// A bare `Task{start}` + `Task{stop}` (or stop awaiting only the latest start) lets a rapid
+    /// stop→start race two operations on the same AVAudioEngine, leaking the mic or wedging it.
+    private var parakeetMeterChain = Task<Void, Never> {}
+
     private func startParakeetMeter() {
         // Don't open the meter mic while the user is listening on AirPods: a second input
         // session knocks them out of music mode into call mode and interrupts their audio.
@@ -276,15 +294,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
                 self?.edgeGlow.updateLevel(level)
             }
         }
-        Task {
-            do { try await parakeetMeter.start(onChunk: { _ in }, deliverChunks: false) }
-            catch { /* keep the self-breathing aura; transcription (daemon) is unaffected */ }
+        let previous = parakeetMeterChain
+        parakeetMeterChain = Task { [parakeetMeter] in
+            await previous.value
+            // deliverChunks:false — the meter only drives the aura; it doesn't need the daemon's
+            // PCM delivered anywhere (the daemon owns transcription in its own process).
+            try? await parakeetMeter.start(onChunk: { _ in }, deliverChunks: false)
         }
     }
 
     private func stopParakeetMeter() {
         parakeetMeter.onLevel = nil
-        Task { await parakeetMeter.stop() }
+        let previous = parakeetMeterChain
+        parakeetMeterChain = Task { [parakeetMeter] in
+            await previous.value
+            await parakeetMeter.stop()
+        }
     }
 
     private func render(_ state: DictationState) {
@@ -317,13 +342,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         }
     }
 
-    /// No API key set: open Settings the FIRST time you try to dictate (helpful for a new
-    /// user), then stop — so pressing the hotkey again doesn't keep popping the window. Also
-    /// a no-op when Settings is already open.
+    /// No API key set: open Settings so the user can add one. A no-op when Settings is already
+    /// open (so a repeated hotkey press doesn't stack windows), but it DOES re-open if they
+    /// closed it without setting a key — otherwise every later dictation silently does nothing
+    /// with no feedback (the old one-shot guard never reset and dead-ended the user).
     private func promptForAPIKeyOnce() {
         if settingsWindow?.isVisible == true { return }
-        guard !didPromptForKey else { return }   // already prompted once — stay silent, no nagging
-        didPromptForKey = true
         openSettings()
     }
 
@@ -348,8 +372,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         if raw.contains("rateLimited") { return "Rate limited" }
         if raw.contains("insufficient_audio_activity") { return "No speech detected" }
         if raw.contains("socketClosed") { return "Connection closed" }
-        if let range = raw.range(of: "HTTP "), raw.distance(from: range.lowerBound, to: raw.endIndex) <= 9 {
-            return String(raw[range.lowerBound...]).trimmingCharacters(in: CharacterSet(charactersIn: "\")"))
+        if let range = raw.range(of: "HTTP ") {
+            // Pull "HTTP <code>" out of a wrapped error like `unknown("HTTP 403")` — the old
+            // length guard assumed the bare string and never matched the wrapped form.
+            let after = raw[range.lowerBound...].prefix { $0 != "\"" && $0 != ")" }
+            return String(after).trimmingCharacters(in: .whitespaces)
         }
         return raw
     }
@@ -558,7 +585,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         let alert = NSAlert()
         alert.alertStyle = .warning
         alert.messageText = "Microphone access is off"
-        alert.informativeText = "Yap can't hear you because microphone access was denied. Open System Settings → Privacy & Security → Microphone, turn on Yap, then press ⌥S again."
+        alert.informativeText = "Yap can't hear you because microphone access was denied. Open System Settings → Privacy & Security → Microphone, turn on Yap, then press \(AppConfig.hotKey.display) again."
         alert.addButton(withTitle: "Open System Settings")
         alert.addButton(withTitle: "Cancel")
         if alert.runModal() == .alertFirstButtonReturn,
@@ -578,9 +605,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         }
     }
 
+    /// Runs on EVERY quit path — the status-bar "Quit", the main-menu ⌘Q (which calls
+    /// NSApplication.terminate directly, bypassing `quit()`), and system logout. Shut the
+    /// Parakeet daemon down so it can't outlive the app holding the microphone and socket.
+    func applicationWillTerminate(_ notification: Notification) {
+        parakeetController.shutdown()
+    }
+
     @objc private func quit() {
-        parakeetController.shutdown()   // stop the local engine daemon, if running
-        NSApplication.shared.terminate(nil)
+        NSApplication.shared.terminate(nil)   // cleanup runs in applicationWillTerminate
     }
 
     enum AppError: Error { case missingAPIKey, localEngineHasNoClient }

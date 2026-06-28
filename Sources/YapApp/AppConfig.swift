@@ -29,7 +29,11 @@ enum AppConfig {
     static var hotKey: HotKeyShortcut {
         get {
             let d = UserDefaults.standard
-            guard d.object(forKey: hotKeyCodeKey) != nil else { return .defaultShortcut }
+            // Require BOTH halves to be present. The three keys are written separately; a process
+            // killed mid-save could leave only the keyCode, yielding a modifier-less shortcut that
+            // registers a bare key globally and swallows every press of that character.
+            guard d.object(forKey: hotKeyCodeKey) != nil,
+                  d.object(forKey: hotKeyModsKey) != nil else { return .defaultShortcut }
             return HotKeyShortcut(
                 keyCode: UInt32(d.integer(forKey: hotKeyCodeKey)),
                 modifiers: UInt32(d.integer(forKey: hotKeyModsKey)),
