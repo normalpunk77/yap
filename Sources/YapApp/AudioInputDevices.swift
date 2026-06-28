@@ -47,7 +47,12 @@ enum AudioInputDevices {
         guard AudioObjectGetPropertyData(
             AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &device) == noErr,
               device != 0 else { return false }
-        return transportType(device) == kAudioDeviceTransportTypeBluetooth
+        // Match BOTH Bluetooth transports: modern AirPods (Pro/Max on recent macOS) report
+        // BluetoothLE, not classic Bluetooth — checking only the latter left the most common
+        // case (the very AirPods this guard exists to protect) unguarded.
+        let transport = transportType(device)
+        return transport == kAudioDeviceTransportTypeBluetooth
+            || transport == kAudioDeviceTransportTypeBluetoothLE
     }
 
     /// Resolve a persisted UID to a live device ID, or nil if that device is gone.

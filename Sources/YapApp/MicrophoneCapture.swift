@@ -82,9 +82,16 @@ final class MicrophoneCapture: AudioCapturer, @unchecked Sendable {
             // self.chunkContinuation from the audio thread — that would race with stop()
             // nil-ing it. A yield after finish() is a safe no-op.
             input.installTap(onBus: 0, bufferSize: 2048, format: nil) { [weak self, continuation] buffer, _ in
-                guard let self, let samples = self.resampleToMonoFloat(buffer) else { return }
-                continuation.yield(PCM16.fromFloat(samples))
-                self.onLevel?(Self.rmsLevel(samples))
+                guard let self else { return }
+                // An NSException raised on the audio thread (e.g. AVAudioConverter choking on a
+                // malformed buffer after a route glitch) would SIGABRT the app — the shim above
+                // only guards the installTap CALL, not these per-buffer callbacks. Funnel the
+                // body through the shim too so such a fault drops a buffer instead of crashing.
+                _ = ocec_perform({
+                    guard let samples = self.resampleToMonoFloat(buffer) else { return }
+                    continuation.yield(PCM16.fromFloat(samples))
+                    self.onLevel?(Self.rmsLevel(samples))
+                }, nil)
             }
         }, &tapError)
         guard installed else {
@@ -95,7 +102,17 @@ final class MicrophoneCapture: AudioCapturer, @unchecked Sendable {
             throw CaptureError.tapFailed(tapError?.localizedDescription ?? "installTap raised")
         }
         engine.prepare()
-        try engine.start()
+        do {
+            try engine.start()
+        } catch {
+            // The engine failed to start AFTER the tap + stream were set up — tear them down so
+            // we don't leak the tap, an open HAL session, and a delivery task that waits forever.
+            input.removeTap(onBus: 0)
+            chunkContinuation?.finish()
+            chunkContinuation = nil
+            deliveryTask = nil
+            throw error
+        }
 
         // A mid-session route/device change (plug/unplug headphones, switch input)
         // makes AVAudioEngine STOP itself — capture would then freeze silently while the
@@ -152,13 +169,18 @@ final class MicrophoneCapture: AudioCapturer, @unchecked Sendable {
             NotificationCenter.default.removeObserver(configObserver)
             self.configObserver = nil
         }
-        engine.inputNode.removeTap(onBus: 0)
-        engine.stop()
-        // Close the pipe; the consumer drains any still-queued buffers (in order) and
-        // ends on its own. The brief flush delay in DictationController.finalize gives
-        // that drain time to land before the explicit commit is sent.
+        // Close the pipe BEFORE stopping the engine: a route-change notification already queued
+        // on the main thread could otherwise see `chunkContinuation != nil` and `!engine.isRunning`
+        // mid-teardown and try to restart the engine we're tearing down.
         chunkContinuation?.finish()
         chunkContinuation = nil
+        engine.inputNode.removeTap(onBus: 0)
+        engine.stop()
+        // Do NOT await the drain here: the consumer flushes its <100ms tail on its own, and
+        // awaiting it would couple finalize to the WebSocket send — on a wedged network that parks
+        // finalize for the whole socket timeout, and BEFORE DictationController arms its
+        // finalize-timeout backstop (it's set up after this returns). The flush delay + finalize
+        // timeout in DictationController bound the tail wait instead.
         deliveryTask = nil
     }
 
@@ -168,7 +190,11 @@ final class MicrophoneCapture: AudioCapturer, @unchecked Sendable {
         // Bluetooth route switch), so it always matches the buffers we receive.
         if let existing = converter,
            existing.inputFormat.sampleRate == buffer.format.sampleRate,
-           existing.inputFormat.channelCount == buffer.format.channelCount {
+           existing.inputFormat.channelCount == buffer.format.channelCount,
+           // Also match the sample TYPE: a device swap (USB) can deliver Int16/Int32 instead of
+           // Float32 at the same rate/channels — a converter built for the old type would garble
+           // or drop the audio.
+           existing.inputFormat.commonFormat == buffer.format.commonFormat {
             // reuse
         } else {
             let made = AVAudioConverter(from: buffer.format, to: targetFormat)
@@ -194,7 +220,7 @@ final class MicrophoneCapture: AudioCapturer, @unchecked Sendable {
             if fed { status.pointee = .noDataNow; return nil }
             fed = true; status.pointee = .haveData; return buffer
         }
-        guard error == nil, let ch = out.floatChannelData else { return nil }
+        guard error == nil, out.frameLength > 0, let ch = out.floatChannelData else { return nil }
         return Array(UnsafeBufferPointer(start: ch[0], count: Int(out.frameLength)))
     }
 

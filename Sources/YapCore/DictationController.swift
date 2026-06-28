@@ -206,15 +206,20 @@ public actor DictationController {
         case .failed(let error):
             // A dropped connection while still listening is recoverable: reconnect and
             // keep the mic running. Fatal errors (auth, quota, bad input) are not.
-            if case .socketClosed = error, case .listening = state, capturing {
-                await reconnect()
-            } else if case .socketClosed = error, case .finalizing = state {
-                // The socket dropped during finalize — the realtime server commonly closes
-                // it right after the commit, sometimes before the final committed segment
-                // reaches us. Don't throw the dictation away with a "Connection closed"
-                // error: deliver what we've accumulated, same as the sendCommit-failure
-                // path and the finalize timeout.
-                await finishAndDeliver()
+            if case .socketClosed = error {
+                if case .listening = state, capturing {
+                    await reconnect()
+                } else if case .finalizing = state {
+                    // The socket dropped during finalize — the realtime server commonly closes
+                    // it right after the commit, sometimes before the final committed segment
+                    // reaches us. Don't throw the dictation away with a "Connection closed"
+                    // error: deliver what we've accumulated, same as the sendCommit-failure
+                    // path and the finalize timeout.
+                    await finishAndDeliver()
+                }
+                // Otherwise we've already left the session (delivered → .idle, or cancelled):
+                // the server closing the socket afterwards is a NORMAL end-of-dictation close,
+                // not a failure. Ignore it instead of flipping a finished dictation to `.error`.
             } else {
                 Diag.conn.error("fatal stream error → stopping: \(String(describing: error), privacy: .public)")
                 await teardown()

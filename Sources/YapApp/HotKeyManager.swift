@@ -10,6 +10,14 @@ enum HotKeyBridge {
     static var apply: (HotKeyShortcut) -> Bool = { _ in false }
 }
 
+/// Lets Settings tell the app to abandon any in-flight dictation when the provider changes —
+/// otherwise a session running on the OLD engine is orphaned (the hotkey now routes elsewhere),
+/// leaving the aura stuck on and the Mac pinned awake. AppDelegate wires `cancelActiveSession`.
+@MainActor
+enum DictationBridge {
+    static var cancelActiveSession: () -> Void = {}
+}
+
 /// Registers a single global hotkey via Carbon and calls `onTrigger` when pressed. The
 /// shortcut can be changed at runtime (`register` unregisters the previous one first), so
 /// the user can rebind it in Settings.

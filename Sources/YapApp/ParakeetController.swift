@@ -9,6 +9,10 @@ import YapCore
 final class ParakeetController {
     private let manager = ParakeetManager.shared
     private var recording = false
+    /// The in-flight clipboard-polling task from the current `stop()`. Held so a new `start()`
+    /// can cancel it — otherwise a stale poller from a previous (e.g. silent) session could fire
+    /// `onText` into the NEXT dictation, pasting the wrong transcript.
+    private var pollTask: Task<Void, Never>?
 
     /// Whether a recording session is currently active (so the hotkey path can skip the
     /// microphone gate when the press is a stop, not a start).
@@ -26,9 +30,27 @@ final class ParakeetController {
         recording ? await stop() : await start()
     }
 
+    /// Abandon an in-flight session WITHOUT delivering — used when the provider is changed under
+    /// us, so a recording started on the local engine isn't left orphaned. Safe when idle.
+    func cancel() async {
+        pollTask?.cancel()
+        pollTask = nil
+        guard recording else { return }
+        recording = false
+        onRecording?(false)               // drops the aura + ends the dictation activity
+        manager.sendDaemonCommand("stop")  // tell the daemon to stop capturing; we discard the result
+    }
+
     func shutdown() { manager.stopDaemon() }
 
     private func start() async {
+        // Cancel any clipboard poller still running from a previous stop() (e.g. a silent
+        // session waiting out its timeout) and AWAIT its exit, so it can't deliver into this new
+        // dictation in the narrow window between its cancel and its next cancellation check.
+        let oldPoll = pollTask
+        pollTask = nil
+        oldPoll?.cancel()
+        await oldPoll?.value
         guard manager.isReady else {
             onError?("Parakeet isn't set up yet. Open Settings → Parakeet and let it finish building and downloading the model.")
             return
@@ -54,17 +76,34 @@ final class ParakeetController {
         // whether any speech was captured. Otherwise a press-without-speaking left the aura lit
         // for the whole no-speech timeout below.
         onRecording?(false)
-        let clipboardBefore = NSPasteboard.general.changeCount
+        let pb = NSPasteboard.general
+        let countBefore = pb.changeCount
         manager.sendDaemonCommand("stop")
-        // The daemon transcribes (~0.5 s) then copies the text to the clipboard. Paste it as
-        // soon as it lands; give up after a few seconds (no speech / silence).
-        for _ in 0 ..< 120 {
-            try? await Task.sleep(nanoseconds: 50_000_000)   // 50 ms × 120 ≈ 6 s
-            if NSPasteboard.general.changeCount != clipboardBefore {
-                let text = NSPasteboard.general.string(forType: .string) ?? ""
-                if !text.isEmpty { onText?(text) }
-                return
+        // The daemon transcribes (~0.5 s) then copies the text to the clipboard. Poll for it in a
+        // cancellable task so a fresh start() can abandon this wait. Give up after ~6 s (silence).
+        let task = Task { [weak self] in
+            for _ in 0 ..< 120 {
+                try? await Task.sleep(nanoseconds: 50_000_000)   // 50 ms × 120 ≈ 6 s
+                if Task.isCancelled { return }
+                guard pb.changeCount != countBefore else { continue }
+                let text = pb.string(forType: .string) ?? ""
+                // A change-count bump after we sent "stop" is the daemon's transcript copy.
+                // Deliver the first non-empty result. Do NOT also require it to differ from the
+                // prior clipboard: a legitimately repeated dictation ("ok" then "ok") copies the
+                // SAME string and must still be delivered, not dropped as a duplicate.
+                if !text.isEmpty {
+                    if Task.isCancelled { return }   // a fresh start() may have cancelled us
+                    // The daemon left the RAW transcript on the clipboard. Clear it before
+                    // delivery so the paste path's clipboard-restore doesn't put that raw text
+                    // back — otherwise a later ⌘V would yield the un-cleaned transcript, not what
+                    // was pasted at the cursor.
+                    pb.clearContents()
+                    self?.onText?(text)
+                    return
+                }
             }
         }
+        pollTask = task
+        await task.value
     }
 }
