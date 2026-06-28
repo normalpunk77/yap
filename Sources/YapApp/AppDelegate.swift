@@ -22,6 +22,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private let parakeetController = ParakeetController()
     private var dictationActivity: NSObjectProtocol?
     private var didPromptForKey = false
+    // Persist the Vertex auth across dictations so its OAuth token cache survives. Rebuilding it
+    // per dictation (as `makePostProcessor` did) threw the cache away and re-minted a token every
+    // time — a JWT sign + token-exchange round trip to Google that dominated the cleanup latency.
+    private var cachedVertexAuth: (account: ServiceAccount, auth: GoogleServiceAccountAuth)?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Recover keys saved under the pre-rename bundle id so they don't appear lost after
@@ -89,7 +93,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             },
             // Keep the mic open ~0.25s after stop so a word spoken right up to the keypress is
             // still captured (its audio isn't recorded yet at the instant of the press).
-            trailingCaptureSeconds: 0.25
+            trailingCaptureSeconds: 0.25,
+            // Safety-net cap on waiting for the provider's post-commit flush before delivering.
+            // The final segment normally arrives on its own (~0.5s) and delivers immediately;
+            // this only bounds the "stopped after a pause, nothing left to flush" case. 1.2s keeps
+            // a ~2x margin over the observed flush while cutting up to ~3s of dead wait that was
+            // delaying both the paste and the LLM cleanup.
+            finalizeTimeoutSeconds: 1.2
         )
         self.controller = controller
 
@@ -157,6 +167,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             UserDefaults.standard.set(true, forKey: "didOnboard")
             openSettings()
         }
+
+        // Mint the Vertex OAuth token now, in the background, so the FIRST dictation's cleanup
+        // doesn't pay the token round trip inline (the rest reuse the cached token). No-op for
+        // API-key auth or when cleanup is disabled/unconfigured.
+        prewarmVertexAuth()
+    }
+
+    /// If Vertex cleanup is configured, build the (cached) auth and fetch a token eagerly so the
+    /// first cleanup is as fast as the rest. Best-effort: failures are ignored — the real
+    /// dictation path mints on demand and falls back to the raw transcript on error.
+    private func prewarmVertexAuth() {
+        let s = AppConfig.postProcessSettings()
+        guard s.enabled, s.authMethod == .vertex, !s.vertexProject.isEmpty,
+              let json = LLMCredentialStore.loadVertexServiceAccountJSON(),
+              let account = ServiceAccount(json: json)
+        else { return }
+        let auth = vertexAuth(for: account)
+        Task { _ = try? await auth.accessToken() }
     }
 
     /// THE single delivery path for every engine: run the optional AI cleanup (which always
@@ -185,7 +213,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
                 let account = ServiceAccount(json: json),
                 !s.vertexProject.isEmpty
             else { return nil }
-            let auth = GoogleServiceAccountAuth(account: account)
+            let auth = vertexAuth(for: account)
             let region = s.vertexRegion.isEmpty ? PostProcessDefaults.vertexRegion : s.vertexRegion
             return GeminiPostProcessor(
                 model: s.model, prompt: s.prompt,
@@ -193,6 +221,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
                               project: s.vertexProject, region: region)
             )
         }
+    }
+
+    /// Reuse one auth actor per service account so its OAuth token cache survives across
+    /// dictations (≈one token mint per hour, not one per dictation). Rebuilds only when the
+    /// stored credentials actually change.
+    private func vertexAuth(for account: ServiceAccount) -> GoogleServiceAccountAuth {
+        if let cached = cachedVertexAuth, cached.account == account { return cached.auth }
+        let auth = GoogleServiceAccountAuth(account: account)
+        cachedVertexAuth = (account, auth)
+        return auth
     }
 
     /// Drive the aura for the local-engine path (the cloud path uses `render(_:)`).
@@ -248,7 +286,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             updateIcon(recording: true)
             edgeGlow.show()
         case .finalizing:
-            break   // keep the glow (and the activity) on until the result is delivered
+            // Recording is over the instant the user presses stop — drop the aura and the
+            // "recording" glyph right away so stop feels instant, instead of leaving the aura
+            // glowing for the up-to-3s finalize safety window (the "why does it take 4-5s to
+            // turn off" lag). The transcript is still being flushed/pasted in the background;
+            // keep the dictation activity alive (no app-nap) until we reach `.idle`.
+            updateIcon(recording: false)
+            edgeGlow.hide()
         case .error(let message):
             endDictationActivity()
             updateIcon(recording: false)

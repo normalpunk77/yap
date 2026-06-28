@@ -195,6 +195,31 @@ final class DictationControllerTests: XCTestCase {
         XCTAssertEqual(end, .idle)                    // graceful, not .error
     }
 
+    func testPressDuringFinalizeDeliversAndRestartsImmediately() async throws {
+        // Regression (perceived "cooldown"): after stop the controller stays `.finalizing` for
+        // up to the safety timeout. A tap during that window used to be swallowed, so the second
+        // dictation wouldn't start until the timeout elapsed. It must instead deliver the
+        // accumulated text and bring up a fresh session right away.
+        let capturer = FakeCapturer()
+        let factory = ClientFactory()
+        let controller = DictationController(
+            capturer: capturer, clientFactory: { factory.make() },
+            flushDelaySeconds: 0, finalizeTimeoutSeconds: 3.0)
+        let result = ResultBox()
+        await controller.setHandlers(onState: { _ in }, onResult: { t in result.set(t) })
+
+        await controller.toggle()                                  // listening; client[0]
+        factory.clients[0].emit(.committed("first round"))
+        try await waitFor { await controller.state == .listening("first round") }
+        await controller.toggle()                                  // finalize (no tail arrives)
+        await controller.toggle()                                  // tap again → deliver + restart
+
+        XCTAssertEqual(result.value, "first round")                // round 1 delivered, not stuck
+        let s = await controller.state
+        XCTAssertEqual(s, .listening(""))                          // round 2 live immediately
+        XCTAssertEqual(capturer.startCount, 2)                     // started again — no cooldown
+    }
+
     func testSocketClosedDuringFinalizeDeliversAccumulatedText() async throws {
         // Regression ("Connection closed" + lost dictation): the realtime server often
         // closes the socket right after the commit — sometimes the `.socketClosed` event

@@ -82,7 +82,16 @@ public actor DictationController {
         switch state {
         case .idle, .error: await start()
         case .listening: await finalize()
-        case .finalizing: break
+        case .finalizing:
+            // Pressing again during the finalize safety window means "I'm done waiting —
+            // start the next dictation now." Deliver what we've accumulated and immediately
+            // bring up a fresh session, instead of swallowing the tap (which felt like a
+            // cooldown: the aura was already off but the second round wouldn't start). Hold
+            // `starting` across both steps so an interleaved tap can't double-fire `start()`.
+            starting = true
+            defer { starting = false }
+            await finishAndDeliver()
+            await start()
         }
     }
 
