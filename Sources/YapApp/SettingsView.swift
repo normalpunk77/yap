@@ -274,8 +274,11 @@ struct SettingsView: View {
                                 TextField("us-central1", text: $vertexRegion)
                                     .textFieldStyle(.roundedBorder)
                                     // Persist on every edit, not only on Return — a Tab-away or
-                                    // window close after editing must not drop the region.
-                                    .onChange(of: vertexRegion) { _, v in AppConfig.vertexRegion = v }
+                                    // window close after editing must not drop the region. Trim so a
+                                    // stray space/newline can't later break the Vertex URL.
+                                    .onChange(of: vertexRegion) { _, v in
+                                        AppConfig.vertexRegion = v.trimmingCharacters(in: .whitespacesAndNewlines)
+                                    }
                             }
                         }
                     }

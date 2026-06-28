@@ -55,6 +55,21 @@ final class GeminiPostProcessorTests: XCTestCase {
         }
     }
 
+    func testVertexMalformedRegionThrowsInsteadOfCrashing() async {
+        // A user-typed region with a space makes the Vertex URL un-constructable. It must throw
+        // (→ raw-transcript fallback), NOT force-unwrap-crash the app.
+        let proc = GeminiPostProcessor(
+            model: .flash, prompt: "SYS",
+            auth: .vertex(token: { "TOK" }, project: "proj", region: "us central 1"),
+            session: MockURLProtocol.session())
+        do {
+            _ = try await proc.process("hi")
+            XCTFail("expected throw")
+        } catch {
+            XCTAssertEqual(error as? GeminiPostProcessorError, .badURL)
+        }
+    }
+
     func testVertexPathHitsRegionalURLWithBearer() async throws {
         var seenURL: URL?
         var seenAuth: String?

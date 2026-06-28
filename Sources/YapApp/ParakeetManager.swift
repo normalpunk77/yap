@@ -90,7 +90,7 @@ final class ParakeetManager: ObservableObject {
         // A daemon orphaned by a previous session (force-quit, crash) keeps running and leaves
         // its pid file behind; the binary then refuses to start ("PID file ... File exists").
         // Kill the orphan and clear the stale pid + socket before launching a fresh one.
-        terminateOrphanedDaemon()
+        await terminateOrphanedDaemon()
         try? fm.removeItem(at: socketURL)
         let process = Process()
         process.executableURL = URL(fileURLWithPath: bin)
@@ -179,7 +179,7 @@ final class ParakeetManager: ObservableObject {
     /// Terminate a daemon left running by a previous session and remove its pid file (both the
     /// path we pass now and the binary's default, for daemons older builds started). Without
     /// this, the leftover pid file makes every new daemon refuse to start.
-    private func terminateOrphanedDaemon() {
+    private func terminateOrphanedDaemon() async {
         for pidFile in [pidURL, defaultPidURL] {
             if let contents = try? String(contentsOf: pidFile, encoding: .utf8),
                let pid = Int32(contents.trimmingCharacters(in: .whitespacesAndNewlines)), pid > 0,
@@ -189,14 +189,16 @@ final class ParakeetManager: ObservableObject {
                 kill(pid, SIGTERM)
                 // Wait briefly for graceful exit, then force-kill: a daemon that ignores SIGTERM
                 // would otherwise keep the mic/socket and race (or double-paste with) the fresh
-                // one we're about to start. The fresh start polls for accept readiness, so this
-                // ~150 ms one-time wait on a rare orphan path is acceptable.
+                // one we're about to start. Async sleep (not usleep) so this rare orphan path
+                // doesn't block the main thread.
                 var alive = true
                 for _ in 0 ..< 15 {
                     if kill(pid, 0) != 0 { alive = false; break }   // ESRCH → gone
-                    usleep(10_000)
+                    try? await Task.sleep(nanoseconds: 10_000_000)   // 10 ms × 15 ≈ 150 ms
                 }
-                if alive { kill(pid, SIGKILL) }
+                // Re-verify identity before the harder kill: the PID could have been recycled to
+                // an unrelated process while we waited.
+                if alive, processPath(pid) == binary.path { kill(pid, SIGKILL) }
             }
             try? fm.removeItem(at: pidFile)
         }

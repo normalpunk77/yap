@@ -106,12 +106,14 @@ public actor GoogleServiceAccountAuth {
         ]
         var error: Unmanaged<CFError>?
         guard let key = SecKeyCreateWithData(der as CFData, attrs as CFDictionary, &error) else {
+            error?.release()   // Security hands back a +1-retained CFError on failure; don't leak it
             throw GoogleAuthError.badPrivateKey
         }
         guard let signature = SecKeyCreateSignature(
             key, .rsaSignatureMessagePKCS1v15SHA256,
             Data(signingInput.utf8) as CFData, &error
         ) else {
+            error?.release()
             throw GoogleAuthError.signingFailed
         }
         return (signature as Data).base64urlEncodedString()

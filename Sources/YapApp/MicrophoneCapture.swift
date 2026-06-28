@@ -176,13 +176,12 @@ final class MicrophoneCapture: AudioCapturer, @unchecked Sendable {
         chunkContinuation = nil
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()
-        // AWAIT the consumer draining its last queued buffers (in order) and flushing the <100ms
-        // tail. Returning before it finishes let DictationController.finalize send its commit
-        // before the tail reached the socket — dropping the last word under load. Now the flush
-        // delay there is a backstop, not the only guarantee.
-        let task = deliveryTask
+        // Do NOT await the drain here: the consumer flushes its <100ms tail on its own, and
+        // awaiting it would couple finalize to the WebSocket send — on a wedged network that parks
+        // finalize for the whole socket timeout, and BEFORE DictationController arms its
+        // finalize-timeout backstop (it's set up after this returns). The flush delay + finalize
+        // timeout in DictationController bound the tail wait instead.
         deliveryTask = nil
-        await task?.value
     }
 
     private func resampleToMonoFloat(_ buffer: AVAudioPCMBuffer) -> [Float]? {

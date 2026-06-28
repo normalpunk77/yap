@@ -3,6 +3,7 @@ import Foundation
 public enum GeminiPostProcessorError: Error, Equatable {
     case httpStatus(Int)
     case emptyResponse
+    case badURL
 }
 
 /// Calls Gemini's `generateContent` to clean a transcript. Two auth styles share the request
@@ -48,8 +49,12 @@ public struct GeminiPostProcessor: TextPostProcessor {
             req.setValue(key, forHTTPHeaderField: "x-goog-api-key")
             return req
         case .vertex(let token, let project, let region):
-            let url = URL(string:
-                "https://\(region)-aiplatform.googleapis.com/v1/projects/\(project)/locations/\(region)/publishers/google/models/\(model.rawValue):generateContent")!
+            // `region` is user-typed (Settings): a stray space/newline makes URL(string:) nil, so
+            // guard instead of force-unwrapping — a malformed region must fail to a thrown error
+            // (→ raw-transcript fallback in PostProcessRunner), never crash the app.
+            guard let url = URL(string:
+                "https://\(region)-aiplatform.googleapis.com/v1/projects/\(project)/locations/\(region)/publishers/google/models/\(model.rawValue):generateContent")
+            else { throw GeminiPostProcessorError.badURL }
             var req = jsonPOST(url, body: body)
             let accessToken = try await token()
             req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
