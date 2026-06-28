@@ -18,11 +18,11 @@ import AppKit
 let emoji = ProcessInfo.processInfo.environment["YAP_EMOJI"] ?? "🎙️"
 let outDir = ProcessInfo.processInfo.environment["YAP_ICONSET"] ?? "Resources/AppIcon.iconset"
 
-// Brand gradient — matches the menu-bar waveform / recording aura.
+// Dark-gray gradient (Apple system-gray dark shades), top → bottom.
 let brand = NSGradient(colors: [
-    NSColor(srgbRed: 0.20, green: 0.85, blue: 0.96, alpha: 1),  // electric cyan
-    NSColor(srgbRed: 0.27, green: 0.52, blue: 1.00, alpha: 1),  // electric blue
-    NSColor(srgbRed: 0.61, green: 0.36, blue: 1.00, alpha: 1),  // ultraviolet
+    NSColor(srgbRed: 0.282, green: 0.282, blue: 0.290, alpha: 1),  // #48484A charcoal
+    NSColor(srgbRed: 0.173, green: 0.173, blue: 0.180, alpha: 1),  // #2C2C2E
+    NSColor(srgbRed: 0.086, green: 0.086, blue: 0.094, alpha: 1),  // #161618 near-black
 ])!
 
 let sizes: [(name: String, px: Int)] = [
