@@ -149,10 +149,11 @@ struct EdgeGlowView: View {
         // staying reactive — the raw mic level is too coarse to draw directly.
         let dt = max(0, min(0.1, time - model.lastTick))
         model.lastTick = time
-        // No real mic levels (Parakeet records in its daemon) → breathe a gentle synthetic
-        // level so the aura clearly reads as "listening" instead of a flat baseline.
+        // No real mic levels yet (Parakeet's daemon owns the mic) → hold a steady baseline
+        // rather than self-animating. The aura stays static; the ONLY thing that moves is the
+        // voice once real mic levels start feeding in (`voiceReactive`).
         if !model.voiceReactive {
-            model.level = 0.45 + 0.35 * (0.5 + 0.5 * sin(time * 1.7))
+            model.level = 0.5
         }
         let tau = model.level > model.displayedLevel ? 0.045 : 0.16
         model.displayedLevel += (model.level - model.displayedLevel) * (1 - exp(-dt / tau))
@@ -161,11 +162,12 @@ struct EdgeGlowView: View {
         let intensity = 0.22 + 0.78 * pow(level, 0.55)
 
         return ZStack {
-            // Three screen-wide, heavily-blurred colour fields drift slowly and overlap
-            // completely, melting into ONE continuous wash — no discrete blobs, no humps.
-            flowField(AuraColors.electricCyan,       center: 0.28, freq: 0.13, phase: 0.0, time: time, width: width, height: height, intensity: intensity)
-            flowField(AuraColors.electricBlueBright, center: 0.52, freq: 0.10, phase: 2.2, time: time, width: width, height: height, intensity: intensity)
-            flowField(AuraColors.ultraviolet,        center: 0.74, freq: 0.11, phase: 4.4, time: time, width: width, height: height, intensity: intensity)
+            // Three screen-wide, heavily-blurred colour fields sit at FIXED positions and
+            // overlap completely, melting into ONE continuous, motionless wash. Nothing here
+            // drifts or bobs — only the shared `intensity` (driven by the mic) changes.
+            flowField(AuraColors.electricCyan,       center: 0.28, width: width, height: height, intensity: intensity)
+            flowField(AuraColors.electricBlueBright, center: 0.52, width: width, height: height, intensity: intensity)
+            flowField(AuraColors.ultraviolet,        center: 0.74, width: width, height: height, intensity: intensity)
         }
         .compositingGroup()
         .frame(width: width, height: height, alignment: .bottom)
@@ -195,12 +197,12 @@ struct EdgeGlowView: View {
         )
     }
 
-    private func flowField(_ color: Color, center: CGFloat, freq: Double, phase: Double,
-                           time: TimeInterval, width: CGFloat, height: CGFloat, intensity: CGFloat) -> some View {
-        let x = width * center + CGFloat(sin(time * freq + phase)) * width * 0.16
-        // Gentle vertical bob (varied per field) gives a soft undulating crest without
-        // breaking the merged wash back into separate humps.
-        let y = height + CGFloat(cos(time * (freq * 1.3) + phase * 1.7)) * height * 0.18
+    private func flowField(_ color: Color, center: CGFloat,
+                           width: CGFloat, height: CGFloat, intensity: CGFloat) -> some View {
+        // Fixed position — no time-based drift or bob. The field is anchored to the bottom
+        // edge at a fixed horizontal center; the aura is static apart from voice intensity.
+        let x = width * center
+        let y = height
         return Ellipse()
             .fill(RadialGradient(colors: [color.opacity(0.50 * intensity), .clear],
                                  center: .center, startRadius: 0, endRadius: width * 0.40))
