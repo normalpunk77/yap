@@ -49,9 +49,18 @@ final class ParakeetManager: ObservableObject {
     /// The built binary's path, or nil if it isn't built yet.
     var binaryPath: String? { fm.isExecutableFile(atPath: binary.path) ? binary.path : nil }
     var modelDirPath: String { modelDir.path }
-    /// True when both the binary and the model are present — ready to transcribe.
+    /// True when both the binary and a COMPLETE model are present — ready to transcribe.
     var isReady: Bool {
-        binaryPath != nil && fm.fileExists(atPath: modelDir.appendingPathComponent("config.json").path)
+        binaryPath != nil && modelDownloaded
+    }
+
+    /// A model download is complete only when BOTH the small config and the large encoder
+    /// weights are present. Gating on `config.json` alone declared a download interrupted after
+    /// the config (but before the multi-hundred-MB encoder) as "ready" — the daemon then failed
+    /// to load the model at start instead of resuming the download.
+    private var modelDownloaded: Bool {
+        fm.fileExists(atPath: modelDir.appendingPathComponent("config.json").path)
+            && fm.fileExists(atPath: modelDir.appendingPathComponent("encoder-model.int8.onnx").path)
     }
 
     /// Build (if needed) and download (if needed) so the engine is ready. Idempotent: returns
@@ -218,7 +227,7 @@ final class ParakeetManager: ObservableObject {
     // MARK: - Download
 
     private func downloadModelIfNeeded() async throws {
-        guard !fm.fileExists(atPath: modelDir.appendingPathComponent("config.json").path) else { return }
+        guard !modelDownloaded else { return }
         guard let bin = binaryPath else { throw ParakeetError.buildProducedNoBinary }
         try fm.createDirectory(at: modelDir, withIntermediateDirectories: true)
         try await runStreaming(bin, ["download", "--model-dir", modelDir.path, "--progress", "json"]) { [weak self] prog in

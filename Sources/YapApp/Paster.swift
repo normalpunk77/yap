@@ -39,7 +39,11 @@ enum Paster {
     }
 
     private static func synthesizeCommandV() {
-        let source = CGEventSource(stateID: .combinedSessionState)
+        // Use a PRIVATE event-source state, not `.combinedSessionState`. The default hotkey is
+        // ⌥S: if the user is still physically holding ⌥ when delivery fires, a combined-state
+        // source merges that live ⌥ into our event, so the target app receives ⌥⌘V ("Paste and
+        // Match Style") instead of ⌘V. A private state carries only the flags we set below.
+        let source = CGEventSource(stateID: .privateState)
         let vDown = CGEvent(keyboardEventSource: source, virtualKey: CGKeyCode(kVK_ANSI_V), keyDown: true)
         vDown?.flags = .maskCommand
         let vUp = CGEvent(keyboardEventSource: source, virtualKey: CGKeyCode(kVK_ANSI_V), keyDown: false)
