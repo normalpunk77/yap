@@ -95,7 +95,17 @@ final class MicrophoneCapture: AudioCapturer, @unchecked Sendable {
             throw CaptureError.tapFailed(tapError?.localizedDescription ?? "installTap raised")
         }
         engine.prepare()
-        try engine.start()
+        do {
+            try engine.start()
+        } catch {
+            // The engine failed to start AFTER the tap + stream were set up — tear them down so
+            // we don't leak the tap, an open HAL session, and a delivery task that waits forever.
+            input.removeTap(onBus: 0)
+            chunkContinuation?.finish()
+            chunkContinuation = nil
+            deliveryTask = nil
+            throw error
+        }
 
         // A mid-session route/device change (plug/unplug headphones, switch input)
         // makes AVAudioEngine STOP itself — capture would then freeze silently while the
@@ -152,14 +162,20 @@ final class MicrophoneCapture: AudioCapturer, @unchecked Sendable {
             NotificationCenter.default.removeObserver(configObserver)
             self.configObserver = nil
         }
-        engine.inputNode.removeTap(onBus: 0)
-        engine.stop()
-        // Close the pipe; the consumer drains any still-queued buffers (in order) and
-        // ends on its own. The brief flush delay in DictationController.finalize gives
-        // that drain time to land before the explicit commit is sent.
+        // Close the pipe BEFORE stopping the engine: a route-change notification already queued
+        // on the main thread could otherwise see `chunkContinuation != nil` and `!engine.isRunning`
+        // mid-teardown and try to restart the engine we're tearing down.
         chunkContinuation?.finish()
         chunkContinuation = nil
+        engine.inputNode.removeTap(onBus: 0)
+        engine.stop()
+        // AWAIT the consumer draining its last queued buffers (in order) and flushing the <100ms
+        // tail. Returning before it finishes let DictationController.finalize send its commit
+        // before the tail reached the socket — dropping the last word under load. Now the flush
+        // delay there is a backstop, not the only guarantee.
+        let task = deliveryTask
         deliveryTask = nil
+        await task?.value
     }
 
     private func resampleToMonoFloat(_ buffer: AVAudioPCMBuffer) -> [Float]? {

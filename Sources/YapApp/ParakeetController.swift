@@ -64,7 +64,6 @@ final class ParakeetController {
         onRecording?(false)
         let pb = NSPasteboard.general
         let countBefore = pb.changeCount
-        let textBefore = pb.string(forType: .string)
         manager.sendDaemonCommand("stop")
         // The daemon transcribes (~0.5 s) then copies the text to the clipboard. Poll for it in a
         // cancellable task so a fresh start() can abandon this wait. Give up after ~6 s (silence).
@@ -74,10 +73,12 @@ final class ParakeetController {
                 if Task.isCancelled { return }
                 guard pb.changeCount != countBefore else { continue }
                 let text = pb.string(forType: .string) ?? ""
-                // Only deliver a genuinely NEW, non-empty transcript. A change-count bump whose
-                // contents match what was already on the clipboard — or are empty — is another
-                // app's write (or a no-op), not the daemon's transcript: keep waiting.
-                if !text.isEmpty, text != textBefore {
+                // A change-count bump after we sent "stop" is the daemon's transcript copy.
+                // Deliver the first non-empty result. Do NOT also require it to differ from the
+                // prior clipboard: a legitimately repeated dictation ("ok" then "ok") copies the
+                // SAME string and must still be delivered, not dropped as a duplicate.
+                if !text.isEmpty {
+                    if Task.isCancelled { return }   // a fresh start() may have cancelled us
                     self?.onText?(text)
                     return
                 }

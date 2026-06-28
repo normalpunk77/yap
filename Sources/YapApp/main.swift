@@ -1,5 +1,10 @@
 import AppKit
 
+// Writing to a pipe whose reader has gone (e.g. the `nc` we spawn to talk to the Parakeet
+// daemon exits early) raises SIGPIPE, whose default action kills the whole app. Ignore it so
+// such a write fails locally (EPIPE) instead of taking the process down.
+signal(SIGPIPE, SIG_IGN)
+
 // Single-instance guard. Two copies of Yap would each register the SAME global hotkey, and
 // macOS delivers a global hotkey to EVERY process that registered it — so one keypress drives
 // both, and the dictation is transcribed and pasted twice (the "it pastes twice" bug). Refuse

@@ -13,6 +13,7 @@ enum Paster {
         let previous = pb.string(forType: .string)
         pb.clearContents()
         pb.setString(text, forType: .string)
+        let writeCount = pb.changeCount
         // Not trusted for Accessibility → we can't synthesize the paste. Leave the transcript on
         // the clipboard so the user can paste it by hand, and DON'T restore (that would discard
         // the very text they need).
@@ -24,6 +25,10 @@ enum Paster {
         // synthesized ⌘V read our string first.
         guard let previous else { return }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+            // Only restore if OUR transcript is still on the clipboard. If a second dictation or
+            // another app wrote in the meantime (changeCount moved), leave theirs untouched
+            // instead of clobbering it with a stale value.
+            guard pb.changeCount == writeCount else { return }
             pb.clearContents()
             pb.setString(previous, forType: .string)
         }
