@@ -310,7 +310,7 @@ struct SettingsView: View {
             }
 
             Section {
-                Text("Hotkey: ⌥S (Option+S) to start / stop dictation.")
+                Text("Hotkey: \(hotKey.display) to start / stop dictation.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -436,7 +436,7 @@ struct SettingsView: View {
         AppConfig.postProcessModel = ppModel
         AppConfig.postProcessPrompt = ppPrompt
         AppConfig.vertexProject = vertexProject
-        AppConfig.vertexRegion = vertexRegion
+        AppConfig.vertexRegion = vertexRegion.trimmingCharacters(in: .whitespacesAndNewlines)
         if ppAuth == .apiKey { LLMCredentialStore.saveGeminiAPIKey(geminiKey) }
         ppStatus = "Verifying…"
         let settings = AppConfig.postProcessSettings()

@@ -21,7 +21,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private var controller: DictationController!
     private let parakeetController = ParakeetController()
     private var dictationActivity: NSObjectProtocol?
-    private var didPromptForKey = false
     // Persist the Vertex auth across dictations so its OAuth token cache survives. Rebuilding it
     // per dictation (as `makePostProcessor` did) threw the cache away and re-minted a token every
     // time — a JWT sign + token-exchange round trip to Google that dominated the cleanup latency.
@@ -315,13 +314,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         }
     }
 
-    /// No API key set: open Settings the FIRST time you try to dictate (helpful for a new
-    /// user), then stop — so pressing the hotkey again doesn't keep popping the window. Also
-    /// a no-op when Settings is already open.
+    /// No API key set: open Settings so the user can add one. A no-op when Settings is already
+    /// open (so a repeated hotkey press doesn't stack windows), but it DOES re-open if they
+    /// closed it without setting a key — otherwise every later dictation silently does nothing
+    /// with no feedback (the old one-shot guard never reset and dead-ended the user).
     private func promptForAPIKeyOnce() {
         if settingsWindow?.isVisible == true { return }
-        guard !didPromptForKey else { return }   // already prompted once — stay silent, no nagging
-        didPromptForKey = true
         openSettings()
     }
 
@@ -346,8 +344,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         if raw.contains("rateLimited") { return "Rate limited" }
         if raw.contains("insufficient_audio_activity") { return "No speech detected" }
         if raw.contains("socketClosed") { return "Connection closed" }
-        if let range = raw.range(of: "HTTP "), raw.distance(from: range.lowerBound, to: raw.endIndex) <= 9 {
-            return String(raw[range.lowerBound...]).trimmingCharacters(in: CharacterSet(charactersIn: "\")"))
+        if let range = raw.range(of: "HTTP ") {
+            // Pull "HTTP <code>" out of a wrapped error like `unknown("HTTP 403")` — the old
+            // length guard assumed the bare string and never matched the wrapped form.
+            let after = raw[range.lowerBound...].prefix { $0 != "\"" && $0 != ")" }
+            return String(after).trimmingCharacters(in: .whitespaces)
         }
         return raw
     }
@@ -556,7 +557,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         let alert = NSAlert()
         alert.alertStyle = .warning
         alert.messageText = "Microphone access is off"
-        alert.informativeText = "Yap can't hear you because microphone access was denied. Open System Settings → Privacy & Security → Microphone, turn on Yap, then press ⌥S again."
+        alert.informativeText = "Yap can't hear you because microphone access was denied. Open System Settings → Privacy & Security → Microphone, turn on Yap, then press \(AppConfig.hotKey.display) again."
         alert.addButton(withTitle: "Open System Settings")
         alert.addButton(withTitle: "Cancel")
         if alert.runModal() == .alertFirstButtonReturn,
@@ -576,9 +577,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         }
     }
 
+    /// Runs on EVERY quit path — the status-bar "Quit", the main-menu ⌘Q (which calls
+    /// NSApplication.terminate directly, bypassing `quit()`), and system logout. Shut the
+    /// Parakeet daemon down so it can't outlive the app holding the microphone and socket.
+    func applicationWillTerminate(_ notification: Notification) {
+        parakeetController.shutdown()
+    }
+
     @objc private func quit() {
-        parakeetController.shutdown()   // stop the local engine daemon, if running
-        NSApplication.shared.terminate(nil)
+        NSApplication.shared.terminate(nil)   // cleanup runs in applicationWillTerminate
     }
 
     enum AppError: Error { case missingAPIKey, localEngineHasNoClient }

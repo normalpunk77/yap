@@ -66,8 +66,21 @@ final class ParakeetManager: ObservableObject {
     /// Build (if needed) and download (if needed) so the engine is ready. Idempotent: returns
     /// immediately when already set up. Runs the heavy steps as child processes, surfacing the
     /// real download progress.
+    private var setupTask: Task<Void, Never>?
+
     func ensureReady() async {
         if isReady { phase = .ready; return }
+        // Coalesce concurrent setups: a second tap (e.g. a Retry double-click) while a build or
+        // download is already in flight must NOT spawn a second cargo build / downloader writing
+        // the same files. Both callers await the one in-flight task.
+        if let setupTask { return await setupTask.value }
+        let task = Task { await runSetup() }
+        setupTask = task
+        defer { setupTask = nil }
+        await task.value
+    }
+
+    private func runSetup() async {
         do {
             try await buildBinaryIfNeeded()
             try await downloadModelIfNeeded()
@@ -314,17 +327,32 @@ final class ParakeetManager: ObservableObject {
         process.arguments = args
         let pipe = Pipe()
         process.standardOutput = pipe
-        process.standardError = FileHandle.nullDevice
+        // stderr → a file (like run()) so a download failure (network/404/TLS) is diagnosable.
+        let errLog = support.appendingPathComponent("setup-stderr.log")
+        try? fm.removeItem(at: errLog)
+        fm.createFile(atPath: errLog.path, contents: nil)
+        let errHandle = try? FileHandle(forWritingTo: errLog)
+        process.standardError = errHandle ?? FileHandle.nullDevice
         try process.run()
-        for try await line in pipe.fileHandleForReading.bytes.lines {
-            if let event = ParakeetDownloadEvent.parse(line),
-               let progress = ParakeetDownloadProgress.from(event) {
-                onProgress(progress)
+        // If the enclosing Task is cancelled (user leaves setup mid-download), terminate the child
+        // so it stops writing the model files — otherwise a later retry races a second downloader
+        // writing the same paths.
+        try await withTaskCancellationHandler {
+            for try await line in pipe.fileHandleForReading.bytes.lines {
+                if let event = ParakeetDownloadEvent.parse(line),
+                   let progress = ParakeetDownloadProgress.from(event) {
+                    onProgress(progress)
+                }
             }
-        }
-        process.waitUntilExit()   // stdout hit EOF → the process has finished
-        guard process.terminationStatus == 0 else {
-            throw ParakeetError.commandFailed(launchPath, Int(process.terminationStatus))
+            process.waitUntilExit()   // stdout hit EOF → the process has finished
+            try? errHandle?.close()
+            guard process.terminationStatus == 0 else {
+                let tail = String((try? String(contentsOf: errLog, encoding: .utf8))?.suffix(2000) ?? "")
+                Diag.conn.error("\((launchPath as NSString).lastPathComponent) download failed (\(process.terminationStatus)): \(tail, privacy: .public)")
+                throw ParakeetError.commandFailed(launchPath, Int(process.terminationStatus))
+            }
+        } onCancel: {
+            process.terminate()
         }
     }
 

@@ -79,6 +79,11 @@ final class ParakeetController {
                 // SAME string and must still be delivered, not dropped as a duplicate.
                 if !text.isEmpty {
                     if Task.isCancelled { return }   // a fresh start() may have cancelled us
+                    // The daemon left the RAW transcript on the clipboard. Clear it before
+                    // delivery so the paste path's clipboard-restore doesn't put that raw text
+                    // back — otherwise a later ⌘V would yield the un-cleaned transcript, not what
+                    // was pasted at the cursor.
+                    pb.clearContents()
                     self?.onText?(text)
                     return
                 }
