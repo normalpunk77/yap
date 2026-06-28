@@ -53,10 +53,14 @@ final class ScriptedClient: TranscriptionClient, @unchecked Sendable {
     private(set) var chunks = 0
     private(set) var closes = 0
     private(set) var primedText: String?
+    var chunkError: Error?
     var commitError: Error?
     init() { (stream, cont) = AsyncStream.makeStream() }
     func emit(_ e: TranscriptEvent) { cont.yield(e) }
-    func sendChunk(_ pcm16: Data) async throws { chunks += 1 }
+    func sendChunk(_ pcm16: Data) async throws {
+        chunks += 1
+        if let chunkError { throw chunkError }
+    }
     func sendCommit() async throws { commits += 1; if let commitError { throw commitError } }
     func close() async { closes += 1 }
     func primePreviousText(_ text: String) { primedText = text }
@@ -110,6 +114,25 @@ final class DictationControllerTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(client.closes, 1)
     }
 
+    func testDuplicatePartialDoesNotReemitSameListeningState() async throws {
+        let capturer = FakeCapturer()
+        let client = ScriptedClient()
+        let controller = DictationController(capturer: capturer, clientFactory: { client }, flushDelaySeconds: 0)
+        let states = StateRecorder()
+        await controller.setHandlers(onState: { states.append($0) }, onResult: { _ in })
+
+        await controller.toggle()
+        client.emit(.partial("hello"))
+        client.emit(.partial("hello"))
+        try await waitFor { await controller.state == .listening("hello") }
+
+        let listeningStates = states.all.filter {
+            if case .listening("hello") = $0 { return true }
+            return false
+        }
+        XCTAssertEqual(listeningStates.count, 1)
+    }
+
     func testErrorEventMovesToErrorState() async throws {
         let capturer = FakeCapturer()
         let client = ScriptedClient()
@@ -122,6 +145,44 @@ final class DictationControllerTests: XCTestCase {
         if case .error = s {} else { XCTFail("expected error state, got \(s)") }
         // Even on the error path the transport is closed during teardown.
         XCTAssertGreaterThanOrEqual(client.closes, 1)
+    }
+
+    func testChunkSendFailureReconnectsInsteadOfDroppingSession() async throws {
+        let capturer = FakeCapturer()
+        let factory = ClientFactory()
+        let controller = DictationController(capturer: capturer, clientFactory: { factory.make() },
+                                             flushDelaySeconds: 0, reconnectBackoffSeconds: 0)
+        await controller.setHandlers(onState: { _ in }, onResult: { _ in })
+
+        await controller.toggle()
+        factory.clients[0].chunkError = TranscriptionError.socketClosed
+        await capturer.onChunk?(Data([0x01, 0x02, 0x03]))
+
+        try await waitFor { factory.clients.count == 2 }
+        let s = await controller.state
+        XCTAssertEqual(s, .listening(""))
+        XCTAssertEqual(factory.clients[0].chunks, 1)
+    }
+
+    func testChunkSendFailureBuffersAudioDuringReconnectGap() async throws {
+        let capturer = FakeCapturer()
+        let factory = ClientFactory()
+        let controller = DictationController(
+            capturer: capturer, clientFactory: { factory.make() },
+            flushDelaySeconds: 0, reconnectBackoffSeconds: 0.05)
+        await controller.setHandlers(onState: { _ in }, onResult: { _ in })
+
+        await controller.toggle()
+        factory.clients[0].chunkError = TranscriptionError.socketClosed
+        await capturer.onChunk?(Data([0x01, 0x02, 0x03]))
+        try await Task.sleep(nanoseconds: 1_000_000)
+        await capturer.onChunk?(Data([0x04, 0x05, 0x06]))
+
+        try await waitFor { factory.clients.count == 2 }
+        try await waitFor { factory.clients.last?.chunks == 2 }
+        let s = await controller.state
+        XCTAssertEqual(s, .listening(""))
+        XCTAssertEqual(factory.clients[0].chunks, 1)
     }
 
     func testRapidSecondToggleDuringStartupIsIgnored() async throws {

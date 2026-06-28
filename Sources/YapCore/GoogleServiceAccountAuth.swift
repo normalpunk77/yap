@@ -39,7 +39,7 @@ public actor GoogleServiceAccountAuth {
     private var expiry: Date = .distantPast
 
     public init(account: ServiceAccount,
-                session: URLSession = .shared,
+                session: URLSession = URLSession(configuration: .ephemeral),
                 now: @escaping @Sendable () -> Date = Date.init) {
         self.account = account
         self.session = session

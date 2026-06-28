@@ -12,10 +12,10 @@ public struct ParakeetDownloadEvent: Decodable, Equatable, Sendable {
     public let totalFiles: Int?
 
     /// Parse one NDJSON line; nil if it isn't a valid event (e.g. a blank/log line).
-    public static func parse(_ line: String) -> ParakeetDownloadEvent? {
+    public static func parse(_ line: String, decoder: JSONDecoder = JSONDecoder()) -> ParakeetDownloadEvent? {
         let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.hasPrefix("{"), let data = trimmed.data(using: .utf8) else { return nil }
-        return try? JSONDecoder().decode(ParakeetDownloadEvent.self, from: data)
+        return try? decoder.decode(ParakeetDownloadEvent.self, from: data)
     }
 }
 

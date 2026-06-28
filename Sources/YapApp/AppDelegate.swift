@@ -104,16 +104,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         self.controller = controller
 
         micCapture.onLevel = { [weak self] level in
-            Task { @MainActor in self?.edgeGlow.updateLevel(level) }
+            DispatchQueue.main.async { [weak self] in self?.edgeGlow.updateLevel(level) }
         }
 
         Task {
             await controller.setHandlers(
                 onState: { state in
-                    Task { @MainActor [weak self] in self?.render(state) }
+                    DispatchQueue.main.async { [weak self] in self?.render(state) }
                 },
                 onResult: { text in
-                    Task { @MainActor [weak self] in self?.deliver(text: text) }
+                    DispatchQueue.main.async { [weak self] in self?.deliver(text: text) }
                 }
             )
         }
@@ -154,11 +154,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         HotKeyBridge.apply = { [weak self] shortcut in self?.applyHotKey(shortcut) ?? false }
 
         // Register for Accessibility on launch so Yap shows up in System Settings →
-        // Privacy → Accessibility (un-toggled) the moment it's installed — the user can
-        // enable it without first having to attempt a dictation. When already trusted this
-        // is a silent no-op; the system dialog only appears the first time, when there is
-        // no TCC entry yet. A one-shot call: no timer, no impact on idle CPU.
-        Paster.promptForAccessibility()
+        // Privacy → Accessibility only when the user actually tries to paste. That avoids an
+        // intrusive permission prompt on first launch and keeps startup free of UX surprises.
 
         // A Dock-less accessory app is easy to "lose" — there's no window or Dock icon,
         // only the menu-bar glyph. Open Settings once, on the very first launch, so the
@@ -184,16 +181,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
               let account = ServiceAccount(json: json)
         else { return }
         let auth = vertexAuth(for: account)
-        Task { _ = try? await auth.accessToken() }
+        Task.detached(priority: .utility) { _ = try? await auth.accessToken() }
     }
 
     /// THE single delivery path for every engine: run the optional AI cleanup (which always
     /// falls back to the raw transcript on any failure), then paste at the cursor.
+    private var deliveryGeneration: UInt64 = 0
+    private var deliveryTask: Task<Void, Never>?
+
     private func deliver(text: String) {
-        Task { @MainActor in
-            let processor = self.makePostProcessor()
+        let processor = makePostProcessor()
+        deliveryGeneration &+= 1
+        let generation = deliveryGeneration
+        deliveryTask?.cancel()
+        guard let processor else {
+            deliveryTask = nil
+            Paster.pasteAtCursor(text)
+            return
+        }
+        deliveryTask = Task.detached(priority: .userInitiated) { [processor, text] in
             let finalText = await PostProcessRunner.run(text, with: processor)
-            Paster.pasteAtCursor(finalText)
+            await MainActor.run {
+                guard generation == self.deliveryGeneration else { return }
+                Paster.pasteAtCursor(finalText)
+                self.deliveryTask = nil
+            }
         }
     }
 
@@ -259,13 +271,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         // The aura simply self-breathes instead (it was already shown that way).
         guard !AudioInputDevices.defaultOutputIsBluetooth() else { return }
         parakeetMeter.onLevel = { [weak self] level in
-            Task { @MainActor in
+            DispatchQueue.main.async { [weak self] in
                 self?.edgeGlow.setVoiceReactive(true)
                 self?.edgeGlow.updateLevel(level)
             }
         }
         Task {
-            do { try await parakeetMeter.start(onChunk: { _ in }) }
+            do { try await parakeetMeter.start(onChunk: { _ in }, deliverChunks: false) }
             catch { /* keep the self-breathing aura; transcription (daemon) is unaffected */ }
         }
     }

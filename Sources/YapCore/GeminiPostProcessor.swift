@@ -21,7 +21,7 @@ public struct GeminiPostProcessor: TextPostProcessor {
     private let auth: Auth
     private let session: URLSession
 
-    public init(model: GeminiModel, prompt: String, auth: Auth, session: URLSession = .shared) {
+    public init(model: GeminiModel, prompt: String, auth: Auth, session: URLSession = URLSession(configuration: .ephemeral)) {
         self.model = model
         self.prompt = prompt
         self.auth = auth

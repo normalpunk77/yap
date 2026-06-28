@@ -17,6 +17,9 @@ enum AppConfig {
     private static let geminiAuthMethodKey = "gemini_auth_method"
     private static let vertexProjectKey = "vertex_project"
     private static let vertexRegionKey = "vertex_region"
+    private static let keytermsCacheLock = NSLock()
+    nonisolated(unsafe) private static var cachedKeytermsRaw = defaultKeytermsRaw
+    nonisolated(unsafe) private static var cachedKeyterms = [String]()
 
     // MARK: Dictation hotkey
 
@@ -84,6 +87,10 @@ enum AppConfig {
 
     static func saveKeytermsRaw(_ raw: String) {
         UserDefaults.standard.set(raw, forKey: keytermsKey)
+        keytermsCacheLock.lock()
+        cachedKeytermsRaw = raw
+        cachedKeyterms = parsedKeyterms(from: raw)
+        keytermsCacheLock.unlock()
     }
 
     /// Falls back to `defaultKeytermsRaw` only when nothing was ever saved (nil).
@@ -95,7 +102,18 @@ enum AppConfig {
     /// Parsed terms ready for the WS query: comma/newline separated, trimmed,
     /// each capped at 20 characters, max 50 terms (ElevenLabs limits).
     static func keyterms() -> [String] {
-        let terms = loadKeytermsRaw()
+        let raw = loadKeytermsRaw()
+        keytermsCacheLock.lock()
+        defer { keytermsCacheLock.unlock() }
+        if raw == cachedKeytermsRaw { return cachedKeyterms }
+        let terms = parsedKeyterms(from: raw)
+        cachedKeytermsRaw = raw
+        cachedKeyterms = terms
+        return terms
+    }
+
+    private static func parsedKeyterms(from raw: String) -> [String] {
+        let terms = raw
             .split(whereSeparator: { $0 == "," || $0 == "\n" })
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }

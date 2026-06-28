@@ -36,6 +36,9 @@ public actor DictationController {
     private var eventTask: Task<Void, Never>?
     private var finalizeTimeoutTask: Task<Void, Never>?
     private var capturing = false
+    private var reconnecting = false
+    private var pendingChunks: [Data] = []
+    private var pendingChunkIndex = 0
     // True only while `start()` is bringing a session up. Its `await`s run with the
     // state already at `.listening`, so without this a second fast toggle would read
     // `.listening` and finalize a half-started session. Toggles are ignored meanwhile.
@@ -108,6 +111,7 @@ public actor DictationController {
     }
 
     private func setState(_ newState: DictationState) {
+        guard state != newState else { return }
         state = newState
         onState?(newState)
     }
@@ -118,6 +122,8 @@ public actor DictationController {
         committedText = ""
         partial = ""
         reconnectAttempts = 0
+        pendingChunks.removeAll(keepingCapacity: true)
+        pendingChunkIndex = 0
         do {
             let client = try clientFactory()
             self.client = client
@@ -147,7 +153,9 @@ public actor DictationController {
     }
 
     private func forwardChunk(_ chunk: Data) async {
-        try? await client?.sendChunk(chunk)
+        pendingChunks.append(chunk)
+        guard let client else { return }
+        await flushPendingChunks(using: client)
     }
 
     private func finalize() async {
@@ -226,6 +234,9 @@ public actor DictationController {
     /// Bring up a fresh connection after a transient drop, without stopping the mic.
     /// Gives up (→ error) after `maxReconnects` consecutive failures.
     private func reconnect() async {
+        guard !reconnecting else { return }
+        reconnecting = true
+        defer { reconnecting = false }
         reconnectAttempts += 1
         guard reconnectAttempts <= maxReconnects else {
             Diag.conn.error("reconnect gave up after \(self.maxReconnects) attempts — surfacing 'Connection closed'")
@@ -242,7 +253,13 @@ public actor DictationController {
         client = nil
         try? await Task.sleep(nanoseconds: UInt64(reconnectAttempts) * reconnectBackoffNanos)
         // The user may have stopped (or it was torn down) during the backoff.
-        guard case .listening = state, capturing else { return }
+        guard capturing else { return }
+        switch state {
+        case .listening, .finalizing:
+            break
+        default:
+            return
+        }
         do {
             let client = try clientFactory()
             self.client = client
@@ -251,6 +268,7 @@ public actor DictationController {
             let tail = Self.contextTail(of: committedText)
             if !tail.isEmpty { client.primePreviousText(tail) }
             startEventLoop(for: client)
+            await flushPendingChunks(using: client)
         } catch {
             await teardown()
             setState(.error("\(error)"))
@@ -299,5 +317,25 @@ public actor DictationController {
         partial = ""
         committedText = ""
         reconnectAttempts = 0
+        pendingChunks.removeAll(keepingCapacity: true)
+        pendingChunkIndex = 0
+    }
+
+    private func flushPendingChunks(using client: TranscriptionClient) async {
+        while pendingChunkIndex < pendingChunks.count {
+            let next = pendingChunks[pendingChunkIndex]
+            do {
+                try await client.sendChunk(next)
+                pendingChunkIndex += 1
+            } catch {
+                Diag.conn.error("chunk send failed → reconnecting: \(Diag.describe(error), privacy: .public)")
+                if capturing { await reconnect() }
+                return
+            }
+        }
+        if pendingChunkIndex > 0 {
+            pendingChunks.removeFirst(pendingChunkIndex)
+            pendingChunkIndex = 0
+        }
     }
 }

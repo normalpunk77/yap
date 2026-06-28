@@ -4,14 +4,14 @@ import Carbon.HIToolbox
 
 enum Paster {
     /// Copies `text` to the clipboard and pastes it at the current cursor via a
-    /// synthesized ⌘V. The clipboard copy always happens; the paste only fires
-    /// when the app is trusted for Accessibility (otherwise the text is left on
-    /// the clipboard and the system prompt is shown so the user can enable it).
+    /// synthesized ⌘V. We only touch the clipboard after Accessibility trust is
+    /// confirmed, so a failed permission prompt does not clobber the user's current
+    /// clipboard contents.
     static func pasteAtCursor(_ text: String) {
+        guard promptForAccessibility() else { return }
         let pb = NSPasteboard.general
         pb.clearContents()
         pb.setString(text, forType: .string)
-        guard promptForAccessibility() else { return }
         synthesizeCommandV()
     }
 

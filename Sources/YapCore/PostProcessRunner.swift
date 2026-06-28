@@ -8,6 +8,7 @@ public enum PostProcessRunner {
         with processor: TextPostProcessor?,
         timeout: Duration = .seconds(8)
     ) async -> String {
+        if Task.isCancelled { return raw }
         guard let processor else { return raw }
         do {
             let cleaned = try await withThrowingTaskGroup(of: String.self) { group -> String in
@@ -21,6 +22,7 @@ public enum PostProcessRunner {
                 return result
             }
             let trimmed = cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
+            if Task.isCancelled { return raw }
             guard !trimmed.isEmpty else {
                 Diag.conn.error("postproc returned empty → pasting raw transcript")
                 return raw

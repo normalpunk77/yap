@@ -16,7 +16,7 @@ let package = Package(
         ),
         .testTarget(
             name: "YapCoreTests",
-            dependencies: ["YapCore", "ObjCExceptionCatcher"]
+            dependencies: ["YapCore", "ObjCExceptionCatcher", "YapApp"]
         ),
     ]
 )

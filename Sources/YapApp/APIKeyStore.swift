@@ -11,6 +11,9 @@ import YapCore
 /// signature you may have to re-enter it — create the stable `Yap Self-Signed` identity (see
 /// scripts/build-app.sh) to avoid that. The security win (no plaintext on disk) holds either way.
 enum APIKeyStore {
+    private static let didMigrateLegacyKeychainKeysFlag = "didMigrateLegacyKeychainKeys"
+    private static let didPurgeLegacyPlaintextKeysFlag = "didPurgeLegacyPlaintextKeys"
+
     private static func service(for provider: TranscriptionProvider) -> String {
         switch provider {
         case .elevenLabs:   return "com.yap.elevenlabs-api-key"
@@ -67,6 +70,8 @@ enum APIKeyStore {
     /// silently vanish from the UI after upgrading. Copy any old-name key to the new service
     /// (only when the new slot is empty) and delete the orphan, so existing users keep their key.
     static func migrateLegacyKeychainKeys() {
+        let defaults = UserDefaults.standard
+        guard !defaults.bool(forKey: didMigrateLegacyKeychainKeysFlag) else { return }
         for provider in [TranscriptionProvider.elevenLabs, .deepgram] {
             if loadAPIKey(for: provider) != nil { continue }   // already present under com.yap
             for prefix in legacyServicePrefixes {
@@ -91,16 +96,20 @@ enum APIKeyStore {
                 break
             }
         }
+        defaults.set(true, forKey: didMigrateLegacyKeychainKeysFlag)
     }
 
     /// One-time hygiene: wipe any plaintext API keys left in UserDefaults by older builds (the
     /// keys now live in the Keychain), in both the current and legacy `com.dictabar` domains,
     /// so no plaintext key lingers on disk.
     static func purgeLegacyPlaintextKeys() {
+        let defaults = UserDefaults.standard
+        guard !defaults.bool(forKey: didPurgeLegacyPlaintextKeysFlag) else { return }
         let keys = ["elevenlabs-api-key", "deepgram-api-key"]
         for key in keys { UserDefaults.standard.removeObject(forKey: key) }
         if let legacy = UserDefaults(suiteName: "com.dictabar") {
             for key in keys { legacy.removeObject(forKey: key) }
         }
+        defaults.set(true, forKey: didPurgeLegacyPlaintextKeysFlag)
     }
 }

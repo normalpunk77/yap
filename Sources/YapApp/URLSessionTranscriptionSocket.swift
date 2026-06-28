@@ -12,7 +12,7 @@ final class URLSessionTranscriptionSocket: NSObject, TranscriptionSocket, URLSes
         super.init()
         // Own the session with `self` as delegate so the WebSocket open/close lifecycle is
         // observable — the close CODE is the single most telling clue for a dropped stream.
-        let session = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
+        let session = URLSession(configuration: .ephemeral, delegate: self, delegateQueue: nil)
         self.session = session
         self.task = session.webSocketTask(with: request)
         Diag.conn.info("\(self.provider, privacy: .public): connecting…")

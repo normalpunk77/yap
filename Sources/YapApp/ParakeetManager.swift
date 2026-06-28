@@ -1,12 +1,13 @@
 import Foundation
 import SwiftUI
 import YapCore
+import Darwin
 
 /// Sets up and owns the local Parakeet engine: builds the `parakeet-cli` binary on the user's
 /// machine (cargo), downloads the model with live progress, and tracks readiness. Everything
 /// lives under `~/Library/Application Support/Yap`. UI observes `phase`.
 @MainActor
-final class ParakeetManager: ObservableObject {
+final class ParakeetManager: ObservableObject, ParakeetManaging {
     enum Phase: Equatable {
         case idle
         case checkingTools
@@ -124,7 +125,11 @@ final class ParakeetManager: ObservableObject {
         // failure fast instead of waiting out the whole timeout.
         for _ in 0 ..< 600 {
             if !process.isRunning { throw ParakeetError.daemonDidNotStart }
-            if fm.fileExists(atPath: socketURL.path) { return }
+            if fm.fileExists(atPath: socketURL.path),
+               let fd = connectUnixSocket(path: socketURL.path) {
+                close(fd)
+                return
+            }
             try await Task.sleep(nanoseconds: 50_000_000)
         }
         throw ParakeetError.daemonDidNotStart
@@ -155,22 +160,78 @@ final class ParakeetManager: ObservableObject {
     }
 
     /// Send a one-word control command (start/stop/toggle/shutdown) to the daemon socket.
-    func sendDaemonCommand(_ command: String) {
-        guard fm.fileExists(atPath: socketURL.path) else { return }
-        let nc = Process()
-        nc.executableURL = URL(fileURLWithPath: "/usr/bin/nc")
-        nc.arguments = ["-U", socketURL.path]
-        let input = Pipe()
-        nc.standardInput = input
-        nc.standardOutput = FileHandle.nullDevice
-        nc.standardError = FileHandle.nullDevice
-        guard (try? nc.run()) != nil else { return }
-        input.fileHandleForWriting.write(Data("\(command)\n".utf8))
-        try? input.fileHandleForWriting.close()
+    func sendDaemonCommand(_ command: String) -> Bool {
+        guard fm.fileExists(atPath: socketURL.path) else { return false }
+        guard let fd = connectUnixSocket(path: socketURL.path) else { return false }
+        defer { close(fd) }
+        let data = Data("\(command)\n".utf8)
+        var writtenAll = false
+        data.withUnsafeBytes { rawBuffer in
+            guard let base = rawBuffer.bindMemory(to: UInt8.self).baseAddress else { return }
+            var written = 0
+            while written < rawBuffer.count {
+                let remaining = rawBuffer.count - written
+                let result = write(fd, base.advanced(by: written), remaining)
+                if result > 0 {
+                    written += result
+                    continue
+                }
+                if result == -1, errno == EINTR { continue }
+                return
+            }
+            writtenAll = true
+        }
+        return writtenAll
+    }
+
+    private func connectUnixSocket(path: String) -> Int32? {
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else { return nil }
+        var noSigPipe: Int32 = 1
+        guard setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE,
+                         &noSigPipe, socklen_t(MemoryLayout.size(ofValue: noSigPipe))) == 0 else {
+            close(fd)
+            return nil
+        }
+
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        addr.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
+
+        let pathCapacity = MemoryLayout.size(ofValue: addr.sun_path)
+        guard path.utf8CString.count <= pathCapacity else {
+            close(fd)
+            return nil
+        }
+
+        let connected = path.withCString { cString -> Bool in
+            withUnsafeMutableBytes(of: &addr.sun_path) { pathBytes in
+                guard let base = pathBytes.bindMemory(to: CChar.self).baseAddress else { return }
+                memset(base, 0, pathBytes.count)
+                _ = strncpy(base, cString, pathBytes.count - 1)
+            }
+            return withUnsafePointer(to: &addr) { addrPtr in
+                addrPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPtr in
+                    while true {
+                        if connect(fd, sockaddrPtr, socklen_t(MemoryLayout<sockaddr_un>.size)) == 0 {
+                            return true
+                        }
+                        if errno == EINTR { continue }
+                        return false
+                    }
+                }
+            }
+        }
+
+        guard connected else {
+            close(fd)
+            return nil
+        }
+        return fd
     }
 
     func stopDaemon() {
-        sendDaemonCommand("shutdown")
+        _ = sendDaemonCommand("shutdown")
         daemon?.terminate()
         daemon = nil
         try? fm.removeItem(at: socketURL)
@@ -238,12 +299,13 @@ final class ParakeetManager: ObservableObject {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: launchPath)
         process.arguments = args
+        let decoder = JSONDecoder()
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = FileHandle.nullDevice
         try process.run()
         for try await line in pipe.fileHandleForReading.bytes.lines {
-            if let event = ParakeetDownloadEvent.parse(line),
+            if let event = ParakeetDownloadEvent.parse(line, decoder: decoder),
                let progress = ParakeetDownloadProgress.from(event) {
                 onProgress(progress)
             }

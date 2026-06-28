@@ -16,11 +16,19 @@ final class MicrophoneCapture: AudioCapturer, @unchecked Sendable {
     // enqueues; a single consumer task awaits `onChunk` strictly in order.
     private var chunkContinuation: AsyncStream<Data>.Continuation?
     private var deliveryTask: Task<Void, Never>?
+    // Tracks whether capture is active regardless of whether we are actually delivering
+    // chunks. Route-change recovery needs this in level-only meter mode too.
+    private var sessionActive = false
     // Observes mid-session audio route/device changes so capture can resume instead of
     // silently freezing (see start). Held for the session, removed in stop.
     private var configObserver: NSObjectProtocol?
 
     func start(onChunk: @escaping @Sendable (Data) async -> Void) async throws {
+        try await start(onChunk: onChunk, deliverChunks: true)
+    }
+
+    func start(onChunk: @escaping @Sendable (Data) async -> Void,
+               deliverChunks: Bool) async throws {
         try await requestPermission()
 
         let input = engine.inputNode
@@ -53,23 +61,29 @@ final class MicrophoneCapture: AudioCapturer, @unchecked Sendable {
         // right after idle) chunks can reach the socket out of order and garble the
         // transcript. A single consumer draining an ordered stream guarantees FIFO and
         // avoids per-buffer task churn. The tap thread only does a cheap, lock-free yield.
-        let (stream, continuation) = AsyncStream<Data>.makeStream(bufferingPolicy: .unbounded)
-        chunkContinuation = continuation
-        // Coalesce the small per-tap buffers (~43 ms at 48 kHz) into ~100 ms chunks
-        // before sending: ElevenLabs recommends 0.1–1 s chunks, and fewer/larger frames
-        // mean fewer base64+JSON encodes and WS sends. The leftover (<100 ms) is flushed
-        // when the stream ends (on stop), so the tail of speech is never dropped.
-        let flushBytes = Int(targetRate) * 2 / 10   // 100 ms of 16-bit mono @ 16 kHz
-        deliveryTask = Task {
-            var pending = Data()
-            for await chunk in stream {
-                pending.append(chunk)
-                if pending.count >= flushBytes {
-                    await onChunk(pending)
-                    pending.removeAll(keepingCapacity: true)
+        let continuation: AsyncStream<Data>.Continuation?
+        if deliverChunks {
+            let (stream, cont) = AsyncStream<Data>.makeStream(bufferingPolicy: .unbounded)
+            chunkContinuation = cont
+            continuation = cont
+            // Coalesce the small per-tap buffers (~43 ms at 48 kHz) into ~100 ms chunks
+            // before sending: ElevenLabs recommends 0.1–1 s chunks, and fewer/larger frames
+            // mean fewer base64+JSON encodes and WS sends. The leftover (<100 ms) is flushed
+            // when the stream ends (on stop), so the tail of speech is never dropped.
+            let flushBytes = Int(targetRate) * 2 / 10   // 100 ms of 16-bit mono @ 16 kHz
+            deliveryTask = Task {
+                var pending = Data()
+                for await chunk in stream {
+                    pending.append(chunk)
+                    if pending.count >= flushBytes {
+                        await onChunk(pending)
+                        pending.removeAll(keepingCapacity: true)
+                    }
                 }
+                if !pending.isEmpty { await onChunk(pending) }
             }
-            if !pending.isEmpty { await onChunk(pending) }
+        } else {
+            continuation = nil
         }
 
         // format: nil → AVAudioEngine binds the node's own LIVE format instead of a
@@ -81,10 +95,21 @@ final class MicrophoneCapture: AudioCapturer, @unchecked Sendable {
             // Capture the continuation by value (it's Sendable) rather than reading
             // self.chunkContinuation from the audio thread — that would race with stop()
             // nil-ing it. A yield after finish() is a safe no-op.
-            input.installTap(onBus: 0, bufferSize: 2048, format: nil) { [weak self, continuation] buffer, _ in
-                guard let self, let samples = self.resampleToMonoFloat(buffer) else { return }
-                continuation.yield(PCM16.fromFloat(samples))
-                self.onLevel?(Self.rmsLevel(samples))
+            input.installTap(onBus: 0, bufferSize: 2048, format: nil) { [weak self, continuation, deliverChunks] buffer, _ in
+                guard let self else { return }
+                if deliverChunks {
+                    guard let samples = self.resampleToMonoFloat(buffer) else { return }
+                    continuation?.yield(PCM16.fromFloat(samples))
+                    if let onLevel = self.onLevel {
+                        onLevel(Self.rmsLevel(samples))
+                    }
+                } else if let onLevel = self.onLevel {
+                    if let level = Self.rmsLevel(buffer) {
+                        onLevel(level)
+                    } else if let samples = self.resampleToMonoFloat(buffer) {
+                        onLevel(Self.rmsLevel(samples))
+                    }
+                }
             }
         }, &tapError)
         guard installed else {
@@ -92,10 +117,12 @@ final class MicrophoneCapture: AudioCapturer, @unchecked Sendable {
             chunkContinuation?.finish()
             chunkContinuation = nil
             deliveryTask = nil
+            sessionActive = false
             throw CaptureError.tapFailed(tapError?.localizedDescription ?? "installTap raised")
         }
         engine.prepare()
         try engine.start()
+        sessionActive = true
 
         // A mid-session route/device change (plug/unplug headphones, switch input)
         // makes AVAudioEngine STOP itself — capture would then freeze silently while the
@@ -110,7 +137,7 @@ final class MicrophoneCapture: AudioCapturer, @unchecked Sendable {
     /// engine is already running. If it can't be restarted, end the chunk stream so the
     /// session stops cleanly rather than hanging on a dead microphone.
     private func restartAfterRouteChange() {
-        guard chunkContinuation != nil, !engine.isRunning else { return }
+        guard sessionActive, !engine.isRunning else { return }
         // Re-assert the chosen mic on the NEW route — otherwise a Bluetooth device that
         // just connected mid-session would capture us and (when the default is built-in)
         // flip into low-quality call mode, dropping the user's music.
@@ -122,6 +149,7 @@ final class MicrophoneCapture: AudioCapturer, @unchecked Sendable {
             chunkContinuation?.finish()
             chunkContinuation = nil
             deliveryTask = nil
+            sessionActive = false
         }
     }
 
@@ -148,6 +176,7 @@ final class MicrophoneCapture: AudioCapturer, @unchecked Sendable {
     }
 
     func stop() async {
+        sessionActive = false
         if let configObserver {
             NotificationCenter.default.removeObserver(configObserver)
             self.configObserver = nil
@@ -203,6 +232,23 @@ final class MicrophoneCapture: AudioCapturer, @unchecked Sendable {
         var sum: Float = 0
         for sample in samples { sum += sample * sample }
         let rms = (sum / Float(samples.count)).squareRoot()
+        return min(Double(rms) * 8.0, 1.0)
+    }
+
+    static func rmsLevel(_ buffer: AVAudioPCMBuffer) -> Double? {
+        guard let channels = buffer.floatChannelData else { return nil }
+        let frameCount = Int(buffer.frameLength)
+        guard frameCount > 0 else { return 0 }
+        let channelCount = Int(buffer.format.channelCount)
+        var sum: Float = 0
+        for channel in 0 ..< channelCount {
+            let samples = channels[channel]
+            for frame in 0 ..< frameCount {
+                let sample = samples[frame]
+                sum += sample * sample
+            }
+        }
+        let rms = (sum / Float(frameCount * channelCount)).squareRoot()
         return min(Double(rms) * 8.0, 1.0)
     }
 

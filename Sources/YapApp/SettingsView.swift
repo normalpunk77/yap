@@ -513,7 +513,8 @@ enum ElevenLabsKeyCheck {
         var req = URLRequest(url: url)
         req.setValue(key, forHTTPHeaderField: "xi-api-key")
         do {
-            let (_, resp) = try await URLSession.shared.data(for: req)
+            let session = URLSession(configuration: .ephemeral)
+            let (_, resp) = try await session.data(for: req)
             let code = (resp as? HTTPURLResponse)?.statusCode ?? -1
             switch code {
             case 200: return "✓ Valid key — saved"
