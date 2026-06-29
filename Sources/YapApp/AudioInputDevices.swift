@@ -60,18 +60,30 @@ enum AudioInputDevices {
         all().first { $0.uid == uid }?.id
     }
 
-    /// The device's current nominal sample rate, if Core Audio exposes one.
-    static func nominalSampleRate(for device: AudioDeviceID) -> Double? {
-        var addr = AudioObjectPropertyAddress(
-            mSelector: kAudioDevicePropertyNominalSampleRate,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain)
-        var rate: Double = 0
-        var size = UInt32(MemoryLayout<Double>.size)
-        guard AudioObjectGetPropertyData(device, &addr, 0, nil, &size, &rate) == noErr else {
-            return nil
+    /// Choose the dictation input UID without touching Core Audio state. When the user is
+    /// listening on Bluetooth output, prefer the built-in mic so we do not push AirPods into
+    /// call mode. Otherwise honor a valid persisted selection and fall back to the built-in mic
+    /// or the first available input.
+    static func preferredDictationInputUID(devices: [AudioInputDevice],
+                                           preferredInputDeviceUID: String?,
+                                           defaultOutputIsBluetooth: Bool) -> String? {
+        if defaultOutputIsBluetooth {
+            return devices.first(where: { $0.isBuiltIn })?.uid
         }
-        return rate > 0 ? rate : nil
+        if let preferredInputDeviceUID,
+           devices.contains(where: { $0.uid == preferredInputDeviceUID }) {
+            return preferredInputDeviceUID
+        }
+        return devices.first(where: { $0.isBuiltIn })?.uid ?? devices.first?.uid
+    }
+
+    /// Production wrapper for the active dictation input policy.
+    static func preferredDictationInputUID() -> String? {
+        preferredDictationInputUID(
+            devices: all(),
+            preferredInputDeviceUID: AppConfig.preferredInputDeviceUID,
+            defaultOutputIsBluetooth: defaultOutputIsBluetooth()
+        )
     }
 
     // MARK: - Core Audio plumbing

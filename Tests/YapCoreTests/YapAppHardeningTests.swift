@@ -201,14 +201,62 @@ final class AppConfigMigrationTests: XCTestCase {
 }
 
 final class AudioInputDevicesTests: XCTestCase {
-    func testNominalSampleRateIsReadableForBuiltInMic() throws {
-        guard let mic = AudioInputDevices.builtIn() else {
-            throw XCTSkip("No built-in microphone available on this machine")
-        }
+    func testPrefersBuiltinMicWhenOutputIsBluetooth() {
+        let devices = [
+            AudioInputDevice(id: 1, uid: "airpods", name: "AirPods", isBuiltIn: false),
+            AudioInputDevice(id: 2, uid: "builtin", name: "Mac mic", isBuiltIn: true)
+        ]
 
-        let rate = AudioInputDevices.nominalSampleRate(for: mic.id)
-        XCTAssertNotNil(rate)
-        XCTAssertGreaterThan(rate ?? 0, 0)
+        let uid = AudioInputDevices.preferredDictationInputUID(
+            devices: devices,
+            preferredInputDeviceUID: "airpods",
+            defaultOutputIsBluetooth: true
+        )
+
+        XCTAssertEqual(uid, "builtin")
+    }
+
+    func testHonorsPersistedInputWhenOutputIsNotBluetooth() {
+        let devices = [
+            AudioInputDevice(id: 1, uid: "usb", name: "USB mic", isBuiltIn: false),
+            AudioInputDevice(id: 2, uid: "builtin", name: "Mac mic", isBuiltIn: true)
+        ]
+
+        let uid = AudioInputDevices.preferredDictationInputUID(
+            devices: devices,
+            preferredInputDeviceUID: "usb",
+            defaultOutputIsBluetooth: false
+        )
+
+        XCTAssertEqual(uid, "usb")
+    }
+
+    func testFallsBackToFirstDeviceWhenBuiltinIsMissing() {
+        let devices = [
+            AudioInputDevice(id: 1, uid: "usb", name: "USB mic", isBuiltIn: false)
+        ]
+
+        let uid = AudioInputDevices.preferredDictationInputUID(
+            devices: devices,
+            preferredInputDeviceUID: nil,
+            defaultOutputIsBluetooth: false
+        )
+
+        XCTAssertEqual(uid, "usb")
+    }
+
+    func testReturnsNilWhenBluetoothOutputHasNoBuiltinMicToUse() {
+        let devices = [
+            AudioInputDevice(id: 1, uid: "usb", name: "USB mic", isBuiltIn: false)
+        ]
+
+        let uid = AudioInputDevices.preferredDictationInputUID(
+            devices: devices,
+            preferredInputDeviceUID: "usb",
+            defaultOutputIsBluetooth: true
+        )
+
+        XCTAssertNil(uid)
     }
 }
 

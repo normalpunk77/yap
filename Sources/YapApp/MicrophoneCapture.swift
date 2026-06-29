@@ -1,7 +1,7 @@
 @preconcurrency import AVFoundation
-import CoreAudio
+import CoreMedia
+import Foundation
 import YapCore
-import ObjCExceptionCatcher
 
 private actor FlushWaitState {
     private var finished = false
@@ -17,25 +17,26 @@ private actor FlushWaitState {
     func isTimedOut() -> Bool { timedOut }
 }
 
-final class MicrophoneCapture: AudioCapturer, @unchecked Sendable {
+final class MicrophoneCapture: NSObject, AudioCapturer, AVCaptureAudioDataOutputSampleBufferDelegate, @unchecked Sendable {
     /// Optional live input level in 0...1, emitted per audio buffer (off the main
     /// thread). Set before `start`; used to drive the HUD waveform.
     var onLevel: (@Sendable (Double) -> Void)?
 
-    private let engine = AVAudioEngine()
+    private let session = AVCaptureSession()
+    private let outputQueue = DispatchQueue(label: "com.yap.microphone-capture.output")
     private let targetRate: Double = 16000
     private var converter: AVAudioConverter?
     private var targetFormat: AVAudioFormat!
-    // Audio chunks flow through ONE ordered stream (see start): the tap thread only
-    // enqueues; a single consumer task awaits `onChunk` strictly in order.
+    // Audio chunks flow through ONE ordered stream. The capture delegate only enqueues;
+    // a single consumer task awaits `onChunk` strictly in order.
     private var chunkContinuation: AsyncStream<Data>.Continuation?
     private var deliveryTask: Task<Void, Never>?
     // Tracks whether capture is active regardless of whether we are actually delivering
     // chunks. Route-change recovery needs this in level-only meter mode too.
     private var sessionActive = false
-    // Observes mid-session audio route/device changes so capture can resume instead of
-    // silently freezing (see start). Held for the session, removed in stop.
-    private var configObserver: NSObjectProtocol?
+    private var activeInput: AVCaptureDeviceInput?
+    private var activeOutput: AVCaptureAudioDataOutput?
+    private var configObservers: [NSObjectProtocol] = []
 
     func start(onChunk: @escaping @Sendable (Data) async -> Void) async throws {
         try await start(onChunk: onChunk, deliverChunks: true)
@@ -45,40 +46,19 @@ final class MicrophoneCapture: AudioCapturer, @unchecked Sendable {
                deliverChunks: Bool) async throws {
         try await requestPermission()
 
-        let input = engine.inputNode
-        // Defensive: a tap left from a previous start() (or a double toggle) makes
-        // installTap throw an UNCAUGHT NSException -> SIGABRT (app crash). Clear first.
-        input.removeTap(onBus: 0)
-        // Capture from the user's chosen mic, defaulting to the built-in one rather than
-        // whatever is the system default input. Recording through a Bluetooth headset's
-        // mic (AirPods) forces it out of A2DP (stereo music) into HFP (mono call mode), so
-        // the user's music drops out the moment dictation starts. Pinning the built-in
-        // device keeps the headset in music mode. Best-effort: falls back to the default
-        // input if the chosen device isn't found/settable.
-        Self.preferSelectedInput(on: input)
         targetFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32,
                                      sampleRate: targetRate,
                                      channels: 1,
                                      interleaved: false)!
-        // Built lazily from the first buffer's REAL format (see resampleToMonoFloat):
-        // the live hardware rate can differ from what we read here and can change
-        // mid-stream — Bluetooth mics (AirPods) flip between 24 and 48 kHz.
+        // Built lazily from the first buffer's REAL format. The live hardware rate can
+        // differ from what we read here and can change mid-stream.
         converter = nil
 
-        // One serial pipe instead of a Task per buffer. Spawning `Task { await onChunk }`
-        // per buffer runs the sends CONCURRENTLY, so under load (e.g. App Nap throttling
-        // right after idle) chunks can reach the socket out of order and garble the
-        // transcript. A single consumer draining an ordered stream guarantees FIFO and
-        // avoids per-buffer task churn. The tap thread only does a cheap, lock-free yield.
-        let continuation: AsyncStream<Data>.Continuation?
         if deliverChunks {
             let (stream, cont) = AsyncStream<Data>.makeStream(bufferingPolicy: .unbounded)
             chunkContinuation = cont
-            continuation = cont
-            // Coalesce the small per-tap buffers (~43 ms at 48 kHz) into ~100 ms chunks
-            // before sending: ElevenLabs recommends 0.1–1 s chunks, and fewer/larger frames
-            // mean fewer base64+JSON encodes and WS sends. The leftover (<100 ms) is flushed
-            // when the stream ends (on stop), so the tail of speech is never dropped.
+            // Coalesce the small per-buffer chunks into ~100 ms frames before sending:
+            // fewer frames mean fewer JSON/base64 encodes and WS sends.
             let flushBytes = Int(targetRate) * 2 / 10   // 100 ms of 16-bit mono @ 16 kHz
             deliveryTask = Task {
                 var pending = Data()
@@ -91,51 +71,31 @@ final class MicrophoneCapture: AudioCapturer, @unchecked Sendable {
                 }
                 if !pending.isEmpty { await onChunk(pending) }
             }
-        } else {
-            continuation = nil
         }
 
-        try installTap(on: input, deliverChunks: deliverChunks, continuation: continuation)
-        engine.prepare()
         do {
-            try engine.start()
+            try configureSession()
+            session.startRunning()
         } catch {
-            // The engine failed to start AFTER the tap + stream were set up — tear them down so
-            // we don't leak the tap, an open HAL session, and a delivery task that waits forever.
-            input.removeTap(onBus: 0)
             chunkContinuation?.finish()
             chunkContinuation = nil
             deliveryTask = nil
+            teardownSessionConfiguration()
             throw error
         }
-        sessionActive = true
 
-        // A mid-session route/device change (plug/unplug headphones, switch input)
-        // makes AVAudioEngine STOP itself — capture would then freeze silently while the
-        // aura stays lit. Observe that and restart the engine on the new route, reinstalling
-        // the tap because the engine's I/O unit can be rebuilt under us.
-        configObserver = NotificationCenter.default.addObserver(
-            forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main
-        ) { [weak self] _ in self?.restartAfterRouteChange() }
+        sessionActive = true
+        installObservers()
     }
 
-    /// Resume capture after the engine stopped on a configuration change. No-op if the
-    /// engine is already running. If it can't be restarted, end the chunk stream so the
-    /// session stops cleanly rather than hanging on a dead microphone.
+    /// Resume capture after the session stopped on a configuration change or runtime error.
+    /// No-op if the session is already running. If it can't be restarted, end the chunk stream
+    /// so the session stops cleanly rather than hanging on a dead microphone.
     private func restartAfterRouteChange() {
-        guard sessionActive, !engine.isRunning else { return }
-        let input = engine.inputNode
-        // Re-assert the chosen mic on the NEW route — otherwise a Bluetooth device that
-        // just connected mid-session would capture us and (when the default is built-in)
-        // flip into low-quality call mode, dropping the user's music.
-        input.removeTap(onBus: 0)
-        Self.preferSelectedInput(on: input)
+        guard sessionActive, !session.isRunning else { return }
         do {
-            try installTap(on: input,
-                           deliverChunks: chunkContinuation != nil,
-                           continuation: chunkContinuation)
-            engine.prepare()
-            try engine.start()
+            try configureSession()
+            session.startRunning()
         } catch {
             chunkContinuation?.finish()
             chunkContinuation = nil
@@ -144,100 +104,103 @@ final class MicrophoneCapture: AudioCapturer, @unchecked Sendable {
         }
     }
 
-    private func installTap(on input: AVAudioInputNode,
-                            deliverChunks: Bool,
-                            continuation: AsyncStream<Data>.Continuation?) throws {
-        // Use the selected device's nominal sample rate when available, but keep the tap
-        // installation itself centralized so route-change recovery can reinstall it after
-        // AVAudioEngine rebuilds its I/O unit.
-        guard let device = Self.resolveInputDevice(),
-              let tapSampleRate = AudioInputDevices.nominalSampleRate(for: device),
-              tapSampleRate > 0 else {
+    private func configureSession() throws {
+        session.stopRunning()
+        session.beginConfiguration()
+        defer { session.commitConfiguration() }
+
+        teardownSessionConfiguration()
+
+        guard let uid = AudioInputDevices.preferredDictationInputUID(),
+              let device = Self.captureDevice(forUID: uid) else {
             throw CaptureError.noInput
         }
-        let tapFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32,
-                                      sampleRate: tapSampleRate,
-                                      channels: 1,
-                                      interleaved: false)!
-        // ocec_perform stays as the last-resort net: any residual NSException becomes an error.
-        var tapError: NSError?
-        let installed = ocec_perform({
-            // Capture the continuation by value (it's Sendable) rather than reading
-            // self.chunkContinuation from the audio thread — that would race with stop()
-            // nil-ing it. A yield after finish() is a safe no-op.
-            input.installTap(onBus: 0, bufferSize: 2048, format: tapFormat) { [weak self, continuation, deliverChunks] buffer, _ in
-                guard let self else { return }
-                // Funnel the body through the shim: an NSException on the audio thread (e.g.
-                // AVAudioConverter choking on a malformed buffer after a route glitch) would
-                // otherwise SIGABRT — the shim above only guards the installTap CALL, not these
-                // per-buffer callbacks. A fault here drops a buffer instead of crashing.
-                _ = ocec_perform({
-                    if deliverChunks {
-                        guard let samples = self.resampleToMonoFloat(buffer) else { return }
-                        continuation?.yield(PCM16.fromFloat(samples))
-                        self.onLevel?(Self.rmsLevel(samples))
-                    } else if let onLevel = self.onLevel {
-                        // Meter-only (no chunk delivery): get the level cheaply from the buffer
-                        // directly, resampling only as a fallback.
-                        if let level = Self.rmsLevel(buffer) {
-                            onLevel(level)
-                        } else if let samples = self.resampleToMonoFloat(buffer) {
-                            onLevel(Self.rmsLevel(samples))
-                        }
-                    }
-                }, nil)
+
+        let input = try AVCaptureDeviceInput(device: device)
+        guard session.canAddInput(input) else { throw CaptureError.noInput }
+        session.addInput(input)
+
+        let output = AVCaptureAudioDataOutput()
+        output.setSampleBufferDelegate(self, queue: outputQueue)
+        guard session.canAddOutput(output) else { throw CaptureError.noInput }
+        session.addOutput(output)
+
+        activeInput = input
+        activeOutput = output
+    }
+
+    private func teardownSessionConfiguration() {
+        if let activeOutput {
+            activeOutput.setSampleBufferDelegate(nil, queue: nil)
+            session.removeOutput(activeOutput)
+            self.activeOutput = nil
+        }
+        if let activeInput {
+            session.removeInput(activeInput)
+            self.activeInput = nil
+        }
+    }
+
+    private func installObservers() {
+        removeObservers()
+        let center = NotificationCenter.default
+        configObservers = [
+            center.addObserver(forName: .AVCaptureSessionRuntimeError, object: session, queue: .main) { [weak self] _ in
+                self?.restartAfterRouteChange()
+            },
+            center.addObserver(forName: .AVCaptureSessionInterruptionEnded, object: session, queue: .main) { [weak self] _ in
+                self?.restartAfterRouteChange()
             }
-        }, &tapError)
-        guard installed else {
-            input.removeTap(onBus: 0)
-            chunkContinuation?.finish()
-            chunkContinuation = nil
-            deliveryTask = nil
-            sessionActive = false
-            throw CaptureError.tapFailed(tapError?.localizedDescription ?? "installTap raised")
-        }
+        ]
     }
 
-    /// Point the engine's input at the user's chosen mic (or the built-in one by
-    /// default), best-effort. No-op on failure, leaving the system default input.
-    private static func preferSelectedInput(on input: AVAudioInputNode) {
-        guard var device = resolveInputDevice(), let unit = input.audioUnit else { return }
-        AudioUnitSetProperty(unit,
-                             kAudioOutputUnitProperty_CurrentDevice,
-                             kAudioUnitScope_Global,
-                             0,
-                             &device,
-                             UInt32(MemoryLayout<AudioDeviceID>.size))
+    private func removeObservers() {
+        guard !configObservers.isEmpty else { return }
+        let center = NotificationCenter.default
+        for observer in configObservers {
+            center.removeObserver(observer)
+        }
+        configObservers.removeAll(keepingCapacity: true)
     }
 
-    /// The live device ID to capture from: the user's chosen mic when it's still
-    /// present, otherwise the built-in mic (nil only if neither exists).
-    private static func resolveInputDevice() -> AudioDeviceID? {
-        if let uid = AppConfig.preferredInputDeviceUID,
-           let device = AudioInputDevices.deviceID(forUID: uid) {
-            return device
+    private static func captureDevice(forUID uid: String) -> AVCaptureDevice? {
+        let devices = AVCaptureDevice.DiscoverySession(
+            deviceTypes: [.microphone, .external],
+            mediaType: .audio,
+            position: .unspecified
+        ).devices
+        if let matched = devices.first(where: { $0.uniqueID == uid }) {
+            return matched
         }
-        return AudioInputDevices.builtIn()?.id
+        return devices.first(where: { $0.deviceType == .microphone }) ?? AVCaptureDevice.default(for: .audio)
+    }
+
+    func captureOutput(_ output: AVCaptureOutput,
+                       didOutput sampleBuffer: CMSampleBuffer,
+                       from connection: AVCaptureConnection) {
+        guard sessionActive else { return }
+        guard let buffer = Self.makePCMBuffer(from: sampleBuffer) else { return }
+
+        if chunkContinuation != nil {
+            guard let samples = resampleToMonoFloat(buffer) else { return }
+            chunkContinuation?.yield(PCM16.fromFloat(samples))
+            self.onLevel?(Self.rmsLevel(samples))
+        } else if let onLevel = self.onLevel {
+            if let level = Self.rmsLevel(buffer) {
+                onLevel(level)
+            } else if let samples = resampleToMonoFloat(buffer) {
+                onLevel(Self.rmsLevel(samples))
+            }
+        }
     }
 
     func stop() async {
         sessionActive = false
-        if let configObserver {
-            NotificationCenter.default.removeObserver(configObserver)
-            self.configObserver = nil
-        }
-        // Close the pipe BEFORE stopping the engine: a route-change notification already queued
-        // on the main thread could otherwise see `chunkContinuation != nil` and `!engine.isRunning`
-        // mid-teardown and try to restart the engine we're tearing down.
+        removeObservers()
         chunkContinuation?.finish()
         chunkContinuation = nil
-        engine.inputNode.removeTap(onBus: 0)
-        engine.stop()
-        // Do NOT await the drain here: the consumer flushes its <100ms tail on its own, and
-        // awaiting it would couple finalize to the WebSocket send — on a wedged network that parks
-        // finalize for the whole socket timeout, and BEFORE DictationController arms its
-        // finalize-timeout backstop (it's set up after this returns). The flush delay + finalize
-        // timeout in DictationController bound the tail wait instead.
+        session.stopRunning()
+        teardownSessionConfiguration()
     }
 
     func waitForPendingAudioFlush(timeoutNanos: UInt64) async {
@@ -271,23 +234,17 @@ final class MicrophoneCapture: AudioCapturer, @unchecked Sendable {
 
     private func resampleToMonoFloat(_ buffer: AVAudioPCMBuffer) -> [Float]? {
         guard let targetFormat else { return nil }
-        // Rebuild the converter whenever the live input format changes (e.g. a
-        // Bluetooth route switch), so it always matches the buffers we receive.
+        // Rebuild the converter whenever the live input format changes so it always
+        // matches the buffers we receive.
         if let existing = converter,
            existing.inputFormat.sampleRate == buffer.format.sampleRate,
            existing.inputFormat.channelCount == buffer.format.channelCount,
-           // Also match the sample TYPE: a device swap (USB) can deliver Int16/Int32 instead of
-           // Float32 at the same rate/channels — a converter built for the old type would garble
-           // or drop the audio.
            existing.inputFormat.commonFormat == buffer.format.commonFormat {
             // reuse
         } else {
             let made = AVAudioConverter(from: buffer.format, to: targetFormat)
-            // Downsampling the mic (typically 48 kHz) to 16 kHz with the default
-            // converter quality lets high frequencies ALIAS into the speech band and
-            // smears consonants — which makes the model mishear standard words. Force a
-            // proper anti-aliased, highest-quality sample-rate conversion so the 16 kHz
-            // we send is clean (what speech models are trained on).
+            // Downsampling the mic to 16 kHz with the default converter quality lets
+            // high frequencies alias into the speech band and smear consonants.
             made?.sampleRateConverterAlgorithm = AVSampleRateConverterAlgorithm_Mastering
             made?.sampleRateConverterQuality = AVAudioQuality.max.rawValue
             converter = made
@@ -296,17 +253,38 @@ final class MicrophoneCapture: AudioCapturer, @unchecked Sendable {
         let ratio = targetRate / buffer.format.sampleRate
         let capacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 1024
         guard let out = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: capacity) else { return nil }
-        // `convert`'s input block is @Sendable, but AVAudioConverter invokes it
-        // synchronously on this thread — so feeding `buffer` exactly once via a captured
-        // flag is safe. nonisolated(unsafe) tells Swift 6 we vouch for that.
         nonisolated(unsafe) var fed = false
         var error: NSError?
         converter.convert(to: out, error: &error) { _, status in
             if fed { status.pointee = .noDataNow; return nil }
-            fed = true; status.pointee = .haveData; return buffer
+            fed = true
+            status.pointee = .haveData
+            return buffer
         }
         guard error == nil, out.frameLength > 0, let ch = out.floatChannelData else { return nil }
         return Array(UnsafeBufferPointer(start: ch[0], count: Int(out.frameLength)))
+    }
+
+    private static func makePCMBuffer(from sampleBuffer: CMSampleBuffer) -> AVAudioPCMBuffer? {
+        guard CMSampleBufferDataIsReady(sampleBuffer) else { return nil }
+        let frameCount = CMSampleBufferGetNumSamples(sampleBuffer)
+        guard frameCount > 0, frameCount <= Int32.max else { return nil }
+        guard let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer),
+              let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(formatDescription) else {
+            return nil
+        }
+        var streamDescription = asbd.pointee
+        guard let format = AVAudioFormat(streamDescription: &streamDescription) else { return nil }
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(frameCount)) else { return nil }
+        buffer.frameLength = AVAudioFrameCount(frameCount)
+        let status = CMSampleBufferCopyPCMDataIntoAudioBufferList(
+            sampleBuffer,
+            at: 0,
+            frameCount: Int32(frameCount),
+            into: buffer.mutableAudioBufferList
+        )
+        guard status == noErr else { return nil }
+        return buffer
     }
 
     private static func rmsLevel(_ samples: [Float]) -> Double {
@@ -345,5 +323,5 @@ final class MicrophoneCapture: AudioCapturer, @unchecked Sendable {
         }
     }
 
-    enum CaptureError: Error { case micDenied, noInput, tapFailed(String) }
+    enum CaptureError: Error { case micDenied, noInput }
 }
