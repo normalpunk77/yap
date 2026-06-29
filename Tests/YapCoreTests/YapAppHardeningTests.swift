@@ -200,6 +200,18 @@ final class AppConfigMigrationTests: XCTestCase {
     }
 }
 
+final class AudioInputDevicesTests: XCTestCase {
+    func testNominalSampleRateIsReadableForBuiltInMic() throws {
+        guard let mic = AudioInputDevices.builtIn() else {
+            throw XCTSkip("No built-in microphone available on this machine")
+        }
+
+        let rate = AudioInputDevices.nominalSampleRate(for: mic.id)
+        XCTAssertNotNil(rate)
+        XCTAssertGreaterThan(rate ?? 0, 0)
+    }
+}
+
 actor QueueLog {
     private var events: [String] = []
 

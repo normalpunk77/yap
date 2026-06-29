@@ -60,6 +60,20 @@ enum AudioInputDevices {
         all().first { $0.uid == uid }?.id
     }
 
+    /// The device's current nominal sample rate, if Core Audio exposes one.
+    static func nominalSampleRate(for device: AudioDeviceID) -> Double? {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyNominalSampleRate,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        var rate: Double = 0
+        var size = UInt32(MemoryLayout<Double>.size)
+        guard AudioObjectGetPropertyData(device, &addr, 0, nil, &size, &rate) == noErr else {
+            return nil
+        }
+        return rate > 0 ? rate : nil
+    }
+
     // MARK: - Core Audio plumbing
 
     private static func deviceIDs() -> [AudioDeviceID] {

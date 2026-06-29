@@ -56,11 +56,6 @@ final class MicrophoneCapture: AudioCapturer, @unchecked Sendable {
         // device keeps the headset in music mode. Best-effort: falls back to the default
         // input if the chosen device isn't found/settable.
         Self.preferSelectedInput(on: input)
-        // A 0-channel / 0-Hz format means there is genuinely no usable input device.
-        let hwFormat = input.outputFormat(forBus: 0)
-        guard hwFormat.channelCount > 0, hwFormat.sampleRate > 0 else {
-            throw CaptureError.noInput
-        }
         targetFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32,
                                      sampleRate: targetRate,
                                      channels: 1,
@@ -100,17 +95,77 @@ final class MicrophoneCapture: AudioCapturer, @unchecked Sendable {
             continuation = nil
         }
 
-        // Bind the tap to the hardware format we just validated instead of letting
-        // AVAudioEngine infer a possibly stale intermediate format. Some routes were
-        // coming up as 24 kHz taps against a 48 kHz device, which fails engine start.
-        // ocec_perform stays as the last-resort net: any residual NSException becomes
-        // an error.
+        try installTap(on: input, deliverChunks: deliverChunks, continuation: continuation)
+        engine.prepare()
+        do {
+            try engine.start()
+        } catch {
+            // The engine failed to start AFTER the tap + stream were set up — tear them down so
+            // we don't leak the tap, an open HAL session, and a delivery task that waits forever.
+            input.removeTap(onBus: 0)
+            chunkContinuation?.finish()
+            chunkContinuation = nil
+            deliveryTask = nil
+            throw error
+        }
+        sessionActive = true
+
+        // A mid-session route/device change (plug/unplug headphones, switch input)
+        // makes AVAudioEngine STOP itself — capture would then freeze silently while the
+        // aura stays lit. Observe that and restart the engine on the new route, reinstalling
+        // the tap because the engine's I/O unit can be rebuilt under us.
+        configObserver = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main
+        ) { [weak self] _ in self?.restartAfterRouteChange() }
+    }
+
+    /// Resume capture after the engine stopped on a configuration change. No-op if the
+    /// engine is already running. If it can't be restarted, end the chunk stream so the
+    /// session stops cleanly rather than hanging on a dead microphone.
+    private func restartAfterRouteChange() {
+        guard sessionActive, !engine.isRunning else { return }
+        let input = engine.inputNode
+        // Re-assert the chosen mic on the NEW route — otherwise a Bluetooth device that
+        // just connected mid-session would capture us and (when the default is built-in)
+        // flip into low-quality call mode, dropping the user's music.
+        input.removeTap(onBus: 0)
+        Self.preferSelectedInput(on: input)
+        do {
+            try installTap(on: input,
+                           deliverChunks: chunkContinuation != nil,
+                           continuation: chunkContinuation)
+            engine.prepare()
+            try engine.start()
+        } catch {
+            chunkContinuation?.finish()
+            chunkContinuation = nil
+            deliveryTask = nil
+            sessionActive = false
+        }
+    }
+
+    private func installTap(on input: AVAudioInputNode,
+                            deliverChunks: Bool,
+                            continuation: AsyncStream<Data>.Continuation?) throws {
+        // Use the selected device's nominal sample rate when available, but keep the tap
+        // installation itself centralized so route-change recovery can reinstall it after
+        // AVAudioEngine rebuilds its I/O unit.
+        guard let device = Self.resolveInputDevice(),
+              let tapSampleRate = AudioInputDevices.nominalSampleRate(for: device),
+              tapSampleRate > 0 else {
+            throw CaptureError.noInput
+        }
+        let tapFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32,
+                                      sampleRate: tapSampleRate,
+                                      channels: 1,
+                                      interleaved: false)!
+        // ocec_perform stays as the last-resort net: any residual NSException becomes an error.
         var tapError: NSError?
         let installed = ocec_perform({
             // Capture the continuation by value (it's Sendable) rather than reading
             // self.chunkContinuation from the audio thread — that would race with stop()
             // nil-ing it. A yield after finish() is a safe no-op.
-            input.installTap(onBus: 0, bufferSize: 2048, format: hwFormat) { [weak self, continuation, deliverChunks] buffer, _ in
+            input.installTap(onBus: 0, bufferSize: 2048, format: tapFormat) { [weak self, continuation, deliverChunks] buffer, _ in
                 guard let self else { return }
                 // Funnel the body through the shim: an NSException on the audio thread (e.g.
                 // AVAudioConverter choking on a malformed buffer after a route glitch) would
@@ -140,47 +195,6 @@ final class MicrophoneCapture: AudioCapturer, @unchecked Sendable {
             deliveryTask = nil
             sessionActive = false
             throw CaptureError.tapFailed(tapError?.localizedDescription ?? "installTap raised")
-        }
-        engine.prepare()
-        do {
-            try engine.start()
-        } catch {
-            // The engine failed to start AFTER the tap + stream were set up — tear them down so
-            // we don't leak the tap, an open HAL session, and a delivery task that waits forever.
-            input.removeTap(onBus: 0)
-            chunkContinuation?.finish()
-            chunkContinuation = nil
-            deliveryTask = nil
-            throw error
-        }
-        sessionActive = true
-
-        // A mid-session route/device change (plug/unplug headphones, switch input)
-        // makes AVAudioEngine STOP itself — capture would then freeze silently while the
-        // aura stays lit. Observe that and restart the engine on the new route. The tap
-        // is bound to the node's live format (format: nil), so it rebinds automatically.
-        configObserver = NotificationCenter.default.addObserver(
-            forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main
-        ) { [weak self] _ in self?.restartAfterRouteChange() }
-    }
-
-    /// Resume capture after the engine stopped on a configuration change. No-op if the
-    /// engine is already running. If it can't be restarted, end the chunk stream so the
-    /// session stops cleanly rather than hanging on a dead microphone.
-    private func restartAfterRouteChange() {
-        guard sessionActive, !engine.isRunning else { return }
-        // Re-assert the chosen mic on the NEW route — otherwise a Bluetooth device that
-        // just connected mid-session would capture us and (when the default is built-in)
-        // flip into low-quality call mode, dropping the user's music.
-        Self.preferSelectedInput(on: engine.inputNode)
-        do {
-            engine.prepare()
-            try engine.start()
-        } catch {
-            chunkContinuation?.finish()
-            chunkContinuation = nil
-            deliveryTask = nil
-            sessionActive = false
         }
     }
 
