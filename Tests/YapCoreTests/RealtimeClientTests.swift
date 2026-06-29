@@ -1,4 +1,5 @@
 import XCTest
+@testable import YapApp
 @testable import YapCore
 
 final class FakeSocket: TranscriptionSocket, @unchecked Sendable {

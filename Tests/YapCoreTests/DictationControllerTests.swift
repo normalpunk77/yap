@@ -46,6 +46,37 @@ final class GateCapturer: AudioCapturer, @unchecked Sendable {
     }
 }
 
+final class FlushGateCapturer: AudioCapturer, @unchecked Sendable {
+    private let q = DispatchQueue(label: "flush.gate")
+    private var _stopCount = 0
+    private var flushCont: CheckedContinuation<Void, Never>?
+    private var flushReleased = false
+
+    var stopCount: Int { q.sync { _stopCount } }
+
+    func start(onChunk: @escaping @Sendable (Data) async -> Void) async throws {}
+    func stop() async { q.sync { _stopCount += 1 } }
+    func waitForPendingAudioFlush(timeoutNanos: UInt64) async {
+        await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+            let resumeNow = q.sync { () -> Bool in
+                if flushReleased { return true }
+                flushCont = c
+                return false
+            }
+            if resumeNow { c.resume() }
+        }
+    }
+    func releaseFlush() {
+        let c: CheckedContinuation<Void, Never>? = q.sync {
+            flushReleased = true
+            let pending = flushCont
+            flushCont = nil
+            return pending
+        }
+        c?.resume()
+    }
+}
+
 final class ScriptedClient: TranscriptionClient, @unchecked Sendable {
     private let cont: AsyncStream<TranscriptEvent>.Continuation
     private let stream: AsyncStream<TranscriptEvent>
@@ -420,6 +451,26 @@ final class DictationControllerTests: XCTestCase {
         XCTAssertEqual(capturer.stopCount, 0)           // mic still capturing the tail
         await finishing.value
         XCTAssertEqual(capturer.stopCount, 1)           // stopped only after the window
+    }
+
+    func testFinalizeWaitsForPendingAudioFlushBeforeCommit() async throws {
+        let capturer = FlushGateCapturer()
+        let client = ScriptedClient()
+        let controller = DictationController(
+            capturer: capturer, clientFactory: { client },
+            flushDelaySeconds: 0, finalizeTimeoutSeconds: 0)
+        await controller.setHandlers(onState: { _ in }, onResult: { _ in })
+
+        await controller.toggle()   // listening
+        let finalizing = Task { await controller.toggle() }
+
+        try await waitFor { capturer.stopCount == 1 }
+        XCTAssertEqual(client.commits, 0, "commit must not be sent before the audio flush completes")
+
+        capturer.releaseFlush()
+        await finalizing.value
+
+        XCTAssertEqual(client.commits, 1)
     }
 
     func testReconnectsOnSocketClosedAndPrimesContext() async throws {

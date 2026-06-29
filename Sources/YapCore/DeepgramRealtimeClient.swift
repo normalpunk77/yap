@@ -56,11 +56,13 @@ public final class DeepgramRealtimeClient: TranscriptionClient, @unchecked Senda
                         case .committed(let t): continuation.yield(.committed(t))
                         case .ignored: continue
                         }
-                    }
-                } catch let e as TranscriptionError {
+                }
+            } catch let e as TranscriptionError {
+                if e != .socketClosed {
                     Diag.conn.error("Deepgram stream error: \(String(describing: e), privacy: .public)")
-                    continuation.yield(.failed(e))
-                } catch {
+                }
+                continuation.yield(.failed(e))
+            } catch {
                     // A cancellation (we're tearing the session down / reconnecting) is NOT a
                     // dropped socket — yielding .socketClosed here would trigger a spurious
                     // reconnect. Stay silent and just end the stream.

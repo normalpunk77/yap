@@ -3,6 +3,11 @@ import Foundation
 public protocol AudioCapturer: Sendable {
     func start(onChunk: @escaping @Sendable (Data) async -> Void) async throws
     func stop() async
+    func waitForPendingAudioFlush(timeoutNanos: UInt64) async
+}
+
+public extension AudioCapturer {
+    func waitForPendingAudioFlush(timeoutNanos: UInt64) async {}
 }
 
 public enum DictationState: Equatable, Sendable {
@@ -166,9 +171,10 @@ public actor DictationController {
         // live client during this window via `forwardChunk`.
         if trailingCaptureNanos > 0 { try? await Task.sleep(nanoseconds: trailingCaptureNanos) }
         await stopCapture()
-        // Let the last in-flight audio chunk reach the server before committing,
-        // so the tail of fast speech still gets transcribed.
-        if flushDelayNanos > 0 { try? await Task.sleep(nanoseconds: flushDelayNanos) }
+        // Wait for the capture pipeline to hand off the last buffered audio before we
+        // send the commit. This removes the fixed post-stop sleep when the buffer drains
+        // quickly, but still bounds the wait by the configured flush budget.
+        await capturer.waitForPendingAudioFlush(timeoutNanos: flushDelayNanos)
         do {
             try await client?.sendCommit()
         } catch {

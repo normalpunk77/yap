@@ -3,6 +3,20 @@ import CoreAudio
 import YapCore
 import ObjCExceptionCatcher
 
+private actor FlushWaitState {
+    private var finished = false
+    private(set) var timedOut = false
+
+    func complete(timedOut: Bool) -> Bool {
+        guard !finished else { return false }
+        finished = true
+        self.timedOut = timedOut
+        return true
+    }
+
+    func isTimedOut() -> Bool { timedOut }
+}
+
 final class MicrophoneCapture: AudioCapturer, @unchecked Sendable {
     /// Optional live input level in 0...1, emitted per audio buffer (off the main
     /// thread). Set before `start`; used to drive the HUD waveform.
@@ -86,16 +100,17 @@ final class MicrophoneCapture: AudioCapturer, @unchecked Sendable {
             continuation = nil
         }
 
-        // format: nil → AVAudioEngine binds the node's own LIVE format instead of a
-        // pre-read one that may already be stale, which is exactly what makes
-        // installTap fail ("failed to create tap") on a Bluetooth route. ocec_perform
-        // stays as the last-resort net: any residual NSException becomes an error.
+        // Bind the tap to the hardware format we just validated instead of letting
+        // AVAudioEngine infer a possibly stale intermediate format. Some routes were
+        // coming up as 24 kHz taps against a 48 kHz device, which fails engine start.
+        // ocec_perform stays as the last-resort net: any residual NSException becomes
+        // an error.
         var tapError: NSError?
         let installed = ocec_perform({
             // Capture the continuation by value (it's Sendable) rather than reading
             // self.chunkContinuation from the audio thread — that would race with stop()
             // nil-ing it. A yield after finish() is a safe no-op.
-            input.installTap(onBus: 0, bufferSize: 2048, format: nil) { [weak self, continuation, deliverChunks] buffer, _ in
+            input.installTap(onBus: 0, bufferSize: 2048, format: hwFormat) { [weak self, continuation, deliverChunks] buffer, _ in
                 guard let self else { return }
                 // Funnel the body through the shim: an NSException on the audio thread (e.g.
                 // AVAudioConverter choking on a malformed buffer after a route glitch) would
@@ -209,6 +224,34 @@ final class MicrophoneCapture: AudioCapturer, @unchecked Sendable {
         // finalize for the whole socket timeout, and BEFORE DictationController arms its
         // finalize-timeout backstop (it's set up after this returns). The flush delay + finalize
         // timeout in DictationController bound the tail wait instead.
+    }
+
+    func waitForPendingAudioFlush(timeoutNanos: UInt64) async {
+        guard let task = deliveryTask else { return }
+        guard timeoutNanos > 0 else {
+            await task.value
+            deliveryTask = nil
+            return
+        }
+
+        let state = FlushWaitState()
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            Task {
+                await task.value
+                if await state.complete(timedOut: false) {
+                    continuation.resume()
+                }
+            }
+            Task {
+                try? await Task.sleep(nanoseconds: timeoutNanos)
+                if await state.complete(timedOut: true) {
+                    continuation.resume()
+                }
+            }
+        }
+        if await state.isTimedOut() {
+            task.cancel()
+        }
         deliveryTask = nil
     }
 

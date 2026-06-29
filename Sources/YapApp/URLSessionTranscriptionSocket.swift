@@ -106,7 +106,11 @@ final class URLSessionTranscriptionSocket: NSObject, TranscriptionSocket, URLSes
         } catch {
             let status = (task.response as? HTTPURLResponse)?.statusCode
             let mapped = Self.classify(receiveFailure: error, responseStatus: status)
-            Diag.conn.error("\(self.provider, privacy: .public): receive failed (status \(status.map(String.init) ?? "—", privacy: .public)) → \(String(describing: mapped), privacy: .public)")
+            if mapped == .socketClosed {
+                Diag.conn.info("\(self.provider, privacy: .public): receive ended after WebSocket upgrade")
+            } else {
+                Diag.conn.error("\(self.provider, privacy: .public): receive failed (status \(status.map(String.init) ?? "—", privacy: .public)) → \(String(describing: mapped), privacy: .public)")
+            }
             throw mapped
         }
     }
@@ -150,7 +154,12 @@ final class URLSessionTranscriptionSocket: NSObject, TranscriptionSocket, URLSes
         let reasonStr = reason.flatMap { String(data: $0, encoding: .utf8) } ?? "—"
         // closeCode 1000=normal, 1001=going away, 1006=abnormal (no close frame / network
         // drop), 1011=server error, 4xxx=provider-specific (auth/quota/protocol).
-        Diag.conn.error("\(self.provider, privacy: .public): WebSocket closed code=\(closeCode.rawValue) reason=\(reasonStr, privacy: .public) after \(secs, format: .fixed(precision: 1))s")
+        switch closeCode {
+        case .normalClosure, .goingAway:
+            Diag.conn.info("\(self.provider, privacy: .public): WebSocket closed code=\(closeCode.rawValue) reason=\(reasonStr, privacy: .public) after \(secs, format: .fixed(precision: 1))s")
+        default:
+            Diag.conn.error("\(self.provider, privacy: .public): WebSocket closed code=\(closeCode.rawValue) reason=\(reasonStr, privacy: .public) after \(secs, format: .fixed(precision: 1))s")
+        }
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
