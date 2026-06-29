@@ -104,15 +104,29 @@ final class URLSessionTranscriptionSocket: NSObject, TranscriptionSocket, URLSes
             @unknown default: return Data()
             }
         } catch {
-            // Surface the real handshake failure (e.g. 401 key, 400 params,
-            // 403 no model access, 404 endpoint) instead of a generic close.
-            if let http = task.response as? HTTPURLResponse {
-                Diag.conn.error("\(self.provider, privacy: .public): receive failed, HTTP \(http.statusCode)")
-                throw TranscriptionError.unknown("HTTP \(http.statusCode)")
-            }
-            Diag.conn.error("\(self.provider, privacy: .public): receive failed: \(Diag.describe(error), privacy: .public)")
-            throw TranscriptionError.unknown((error as NSError).localizedDescription)
+            let status = (task.response as? HTTPURLResponse)?.statusCode
+            let mapped = Self.classify(receiveFailure: error, responseStatus: status)
+            Diag.conn.error("\(self.provider, privacy: .public): receive failed (status \(status.map(String.init) ?? "—", privacy: .public)) → \(String(describing: mapped), privacy: .public)")
+            throw mapped
         }
+    }
+
+    /// Maps a `receive()` failure to a transcription error.
+    ///
+    /// A successful WebSocket upgrade leaves the task's response as HTTP **101 Switching
+    /// Protocols**. So a *non-101* status means the handshake itself was rejected (401 key,
+    /// 400 params, 403 no model access, 404 endpoint) — a fatal error worth surfacing, since
+    /// retrying it would fail identically. A **101** status (the handshake succeeded) with a
+    /// receive failure means the stream dropped *after* a good handshake: a transient
+    /// mid-dictation drop the controller recovers from by reconnecting, so report
+    /// `.socketClosed` instead of a misleading "HTTP 101". With no HTTP response at all the
+    /// connection never established — surface the transport error.
+    static func classify(receiveFailure error: Error, responseStatus: Int?) -> TranscriptionError {
+        if let status = responseStatus {
+            if status == 101 { return .socketClosed }
+            return .unknown("HTTP \(status)")
+        }
+        return .unknown((error as NSError).localizedDescription)
     }
 
     func close() async {
