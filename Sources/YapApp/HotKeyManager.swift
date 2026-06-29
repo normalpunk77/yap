@@ -50,7 +50,12 @@ final class HotKeyManager {
         let hotKeyID = EventHotKeyID(signature: 0x44494354, id: 1) // 'DICT'
         let status = RegisterEventHotKey(shortcut.keyCode, shortcut.modifiers,
                                          hotKeyID, GetApplicationEventTarget(), 0, &hotKeyRef)
-        if status != noErr { hotKeyRef = nil }
+        if status == noErr, hotKeyRef != nil {
+            Diag.conn.info("hotkey registered: \(shortcut.display, privacy: .public)")
+        } else {
+            hotKeyRef = nil
+            Diag.conn.error("hotkey registration failed: \(shortcut.display, privacy: .public) status=\(status)")
+        }
         return status == noErr && hotKeyRef != nil
     }
 
@@ -64,6 +69,7 @@ final class HotKeyManager {
         InstallEventHandler(GetApplicationEventTarget(), { _, _, ctx in
             guard let ctx else { return noErr }
             let manager = Unmanaged<HotKeyManager>.fromOpaque(ctx).takeUnretainedValue()
+            Diag.conn.info("hotkey triggered")
             manager.onTrigger()
             return noErr
         }, 1, &spec, context, &handlerRef)
