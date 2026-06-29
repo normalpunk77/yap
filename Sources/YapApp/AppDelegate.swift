@@ -1,6 +1,5 @@
 import AppKit
 import AVFoundation
-import ServiceManagement
 import SwiftUI
 import YapCore
 
@@ -21,15 +20,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private var controller: DictationController!
     private let parakeetController = ParakeetController()
     private var dictationActivity: NSObjectProtocol?
+    private var dictationSessionPending = false
+    private var dictationSessionActive = false
     // Persist the Vertex auth across dictations so its OAuth token cache survives. Rebuilding it
     // per dictation (as `makePostProcessor` did) threw the cache away and re-minted a token every
     // time — a JWT sign + token-exchange round trip to Google that dominated the cleanup latency.
     private var cachedVertexAuth: (account: ServiceAccount, auth: GoogleServiceAccountAuth)?
+    private lazy var deliveryQueue = DeliveryQueue(
+        makeProcessor: { [weak self] in self?.makePostProcessor() },
+        paste: { text in Paster.pasteAtCursor(text) }
+    )
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Recover keys saved under the pre-rename bundle id so they don't appear lost after
         // upgrading, then wipe any plaintext keys older builds left in UserDefaults so nothing
         // sensitive lingers in a readable plist.
+        AppConfig.migrateLegacyUserDefaults()
         APIKeyStore.migrateLegacyKeychainKeys()
         APIKeyStore.purgeLegacyPlaintextKeys()
 
@@ -118,19 +124,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         }
 
         parakeetController.onRecording = { [weak self] on in self?.renderParakeet(recording: on) }
-        parakeetController.onError = { [weak self] msg in self?.presentError(msg) }
+        parakeetController.onError = { [weak self] msg in
+            self?.clearDictationSession()
+            self?.presentError(msg)
+        }
         parakeetController.onText = { [weak self] text in self?.deliver(text: text) }
+        parakeetController.onSessionEnded = { [weak self] in self?.clearDictationSession() }
 
         hotKey = HotKeyManager(onTrigger: { [weak self] in
             Task { @MainActor in
                 guard let self else { return }
+                guard !self.dictationSessionPending else { return }
                 // Local engine (Parakeet) records via its daemon — a child process whose mic
                 // access is attributed to Yap. So Yap itself must hold Microphone permission
                 // before we start, or the daemon captures silence (and CoreAudio beeps). Only
                 // gate on start; stopping needs no mic.
                 if AppConfig.provider.isLocal {
                     if !self.parakeetController.isRecording {
-                        guard await self.ensureMicrophoneAuthorized() else { return }
+                        guard !self.dictationSessionActive else { return }
+                        self.beginDictationStartup()
+                        guard await self.ensureMicrophoneAuthorized() else {
+                            self.clearDictationSession()
+                            return
+                        }
                     }
                     await self.parakeetController.toggle()
                     return
@@ -138,6 +154,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
                 // Mic denied earlier and macOS won't re-prompt on its own: guide the
                 // user to re-enable it instead of silently failing to record.
                 guard self.ensureMicrophoneAccess() else { return }
+                switch await self.controller.state {
+                case .idle, .error:
+                    self.beginDictationStartup()
+                case .listening, .finalizing:
+                    break
+                }
                 await self.controller.toggle()
             }
         })
@@ -151,9 +173,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         }
         // Let Settings (re)bind the shortcut and learn whether it took.
         HotKeyBridge.apply = { [weak self] shortcut in self?.applyHotKey(shortcut) ?? false }
-        // Let Settings cancel an in-flight dictation when the provider changes, so a session on
-        // the old engine isn't orphaned (aura stuck on, Mac kept awake).
-        DictationBridge.cancelActiveSession = { [weak self] in self?.cancelActiveDictation() }
+        // Let Settings refuse provider switches while a session is starting or active. That
+        // avoids orphaning or discarding the in-flight transcript.
+        DictationBridge.canSwitchProvider = { [weak self] in
+            guard let self else { return true }
+            return !self.dictationSessionPending && !self.dictationSessionActive
+        }
 
         // Register for Accessibility on launch so Yap shows up in System Settings →
         // Privacy → Accessibility only when the user actually tries to paste. That avoids an
@@ -186,40 +211,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         Task.detached(priority: .utility) { _ = try? await auth.accessToken() }
     }
 
-    /// THE single delivery path for every engine: run the optional AI cleanup (which always
-    /// falls back to the raw transcript on any failure), then paste at the cursor.
-    private var deliveryGeneration: UInt64 = 0
-    private var deliveryTask: Task<Void, Never>?
-
     private func deliver(text: String) {
-        let processor = makePostProcessor()
-        deliveryGeneration &+= 1
-        let generation = deliveryGeneration
-        deliveryTask?.cancel()
-        guard let processor else {
-            deliveryTask = nil
-            Paster.pasteAtCursor(text)
-            return
-        }
-        deliveryTask = Task.detached(priority: .userInitiated) { [processor, text] in
-            let finalText = await PostProcessRunner.run(text, with: processor)
-            await MainActor.run {
-                guard generation == self.deliveryGeneration else { return }
-                Paster.pasteAtCursor(finalText)
-                self.deliveryTask = nil
-            }
-        }
-    }
-
-    /// Abandon any in-flight dictation on BOTH engines (cloud cancel resets to `.idle` → aura off,
-    /// activity ended; local cancel stops the daemon capture). Called when the provider changes so
-    /// the session that was running on the previous engine isn't left orphaned. Both are no-ops
-    /// when idle.
-    private func cancelActiveDictation() {
-        Task { @MainActor in
-            await self.controller.cancel()
-            await self.parakeetController.cancel()
-        }
+        clearDictationSession()
+        deliveryQueue.enqueue(text)
     }
 
     /// Build a Gemini post-processor from current settings + stored credentials, or nil when
@@ -261,6 +255,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     /// Drive the aura for the local-engine path (the cloud path uses `render(_:)`).
     private func renderParakeet(recording: Bool) {
         if recording {
+            markDictationActive()
             beginDictationActivity()
             updateIcon(recording: true)
             // Show the aura immediately in self-breathing mode (no levels yet), then start a
@@ -315,14 +310,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private func render(_ state: DictationState) {
         switch state {
         case .idle:
+            clearDictationSession()
             endDictationActivity()
             updateIcon(recording: false)
             edgeGlow.hide()
         case .listening:
+            markDictationActive()
             beginDictationActivity()
             updateIcon(recording: true)
             edgeGlow.show()
         case .finalizing:
+            dictationSessionPending = false
+            dictationSessionActive = true
             // Recording is over the instant the user presses stop — drop the aura and the
             // "recording" glyph right away so stop feels instant, instead of leaving the aura
             // glowing for the up-to-3s finalize safety window (the "why does it take 4-5s to
@@ -331,6 +330,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             updateIcon(recording: false)
             edgeGlow.hide()
         case .error(let message):
+            clearDictationSession()
             endDictationActivity()
             updateIcon(recording: false)
             edgeGlow.hide()
@@ -399,10 +399,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
 
     private func updateIcon(recording: Bool) {
-        // One recognizable, colorful waveform in BOTH states — no more mic↔waveform
-        // swap that made idle and active look like two different apps. Active state is
-        // signalled by the edge glow / HUD, not by changing the menu-bar glyph.
-        statusItem.button?.image = Self.waveformIcon
+        // Make recording visible in the menu bar too, so the app is not depending only on
+        // the screen-edge aura to communicate state.
+        statusItem.button?.image = recording ? Self.recordingWaveformIcon : Self.waveformIcon
         statusItem.button?.contentTintColor = nil
     }
 
@@ -423,6 +422,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         ])?.draw(in: rect, angle: 0)
         // Clip the gradient to the glyph's shape (use the symbol's alpha as a mask).
         glyph.draw(in: rect, from: rect, operation: .destinationIn, fraction: 1.0)
+        image.unlockFocus()
+        image.isTemplate = false
+        return image
+    }()
+
+    private static let recordingWaveformIcon: NSImage = {
+        let base = waveformIcon.copy() as? NSImage ?? waveformIcon
+        let image = NSImage(size: base.size)
+        image.lockFocus()
+        base.draw(at: .zero, from: .zero, operation: .sourceOver, fraction: 1)
+        let badgeSize = max(4, base.size.width * 0.22)
+        let badgeRect = NSRect(
+            x: base.size.width - badgeSize - 1,
+            y: base.size.height - badgeSize - 1,
+            width: badgeSize,
+            height: badgeSize
+        )
+        NSColor.systemRed.setFill()
+        NSBezierPath(ovalIn: badgeRect).fill()
         image.unlockFocus()
         image.isTemplate = false
         return image
@@ -597,11 +615,64 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     // MARK: - Launch at login
 
     private func configureLoginItem() {
-        // First run after this feature ships: enable launch-at-login (the user asked
-        // for it). Afterwards respect whatever they set in System Settings → Login Items.
-        if !UserDefaults.standard.bool(forKey: "loginItemConfigured") {
-            try? SMAppService.mainApp.register()
-            UserDefaults.standard.set(true, forKey: "loginItemConfigured")
+        // Launch at login is opt-in via Settings only. Do not auto-register on launch.
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard dictationSessionPending || dictationSessionActive ||
+              deliveryQueue.hasPendingWork || Paster.hasPendingClipboardRestore else {
+            return .terminateNow
+        }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.flushInFlightDictationIfNeeded()
+            await self.deliveryQueue.cancelAndDrain()
+            await Paster.waitForPendingClipboardRestore()
+            NSApplication.shared.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
+    }
+
+    /// Shut down dictation cleanly on quit so an active session does not get cut off before the
+    /// transcript reaches the delivery queue. Best-effort with timeout: if the provider stalls,
+    /// quit still completes instead of hanging forever.
+    private func flushInFlightDictationIfNeeded() async {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(10))
+        var stablePolls = 0
+
+        if AppConfig.provider.isLocal {
+            if parakeetController.isRecording {
+                await parakeetController.toggle()
+            }
+        } else {
+            switch await controller.state {
+            case .listening:
+                await controller.toggle()
+            case .finalizing, .idle, .error:
+                break
+            }
+        }
+
+        while ContinuousClock.now < deadline {
+            let cloudBusy: Bool
+            if AppConfig.provider.isLocal {
+                cloudBusy = parakeetController.isRecording
+            } else {
+                switch await controller.state {
+                case .listening, .finalizing:
+                    cloudBusy = true
+                case .idle, .error:
+                    cloudBusy = false
+                }
+            }
+            if !dictationSessionPending && !dictationSessionActive &&
+                !cloudBusy && !deliveryQueue.hasPendingWork {
+                stablePolls += 1
+                if stablePolls >= 3 { return }
+            } else {
+                stablePolls = 0
+            }
+            try? await Task.sleep(nanoseconds: 50_000_000)
         }
     }
 
@@ -614,6 +685,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
     @objc private func quit() {
         NSApplication.shared.terminate(nil)   // cleanup runs in applicationWillTerminate
+    }
+
+    private func beginDictationStartup() {
+        dictationSessionPending = true
+    }
+
+    private func markDictationActive() {
+        dictationSessionPending = false
+        dictationSessionActive = true
+    }
+
+    private func clearDictationSession() {
+        dictationSessionPending = false
+        dictationSessionActive = false
     }
 
     enum AppError: Error { case missingAPIKey, localEngineHasNoClient }

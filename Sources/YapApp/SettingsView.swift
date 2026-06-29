@@ -78,10 +78,12 @@ struct SettingsView: View {
     // General / permissions / microphone — refreshed on appear and on app activation
     // (never polled, so idle stays at ~0% CPU).
     @State private var launchAtLogin: Bool = false
+    @State private var launchAtLoginStatus: String = ""
     @State private var accessibilityGranted: Bool = false
     @State private var micStatus: AVAuthorizationStatus = .notDetermined
     @State private var inputDevices: [MicChoice] = []
     @State private var selectedDeviceUID: String = AppConfig.preferredInputDeviceUID ?? ""
+    @State private var deviceStatus: String = ""
 
     // Dictation hotkey
     @State private var hotKey: HotKeyShortcut = AppConfig.hotKey
@@ -93,9 +95,14 @@ struct SettingsView: View {
     @State private var ppModel: GeminiModel = AppConfig.postProcessModel
     @State private var ppPrompt: String = AppConfig.postProcessPrompt
     @State private var geminiKey: String = LLMCredentialStore.loadGeminiAPIKey() ?? ""
+    @State private var vertexServiceAccountJSON: String = LLMCredentialStore.loadVertexServiceAccountJSON() ?? ""
     @State private var vertexProject: String = AppConfig.vertexProject
     @State private var vertexRegion: String = AppConfig.vertexRegion
     @State private var ppStatus: String = ""
+    @State private var sttVerificationGeneration: UInt64 = 0
+    @State private var ppVerificationGeneration: UInt64 = 0
+    @State private var sttVerificationTask: Task<Void, Never>?
+    @State private var ppVerificationTask: Task<Void, Never>?
 
     // Local engine (Parakeet) setup state
     @ObservedObject private var parakeet = ParakeetManager.shared
@@ -138,6 +145,11 @@ struct SettingsView: View {
             Section("General") {
                 Toggle("Launch at login", isOn: $launchAtLogin)
                     .onChange(of: launchAtLogin) { _, on in setLaunchAtLogin(on) }
+                if !launchAtLoginStatus.isEmpty {
+                    Text(launchAtLoginStatus)
+                        .font(.caption)
+                        .foregroundStyle(launchAtLoginStatus.hasPrefix("⚠️") ? Color.red : .secondary)
+                }
             }
 
             Section("Dictation shortcut") {
@@ -176,7 +188,17 @@ struct SettingsView: View {
                     }
                 }
                 .onChange(of: selectedDeviceUID) { _, uid in
+                    let dictationBusy = !DictationBridge.canSwitchProvider()
+                    guard !SettingsInteractionPolicy.shouldBlockInputDeviceChange(
+                        providerIsLocal: provider.isLocal,
+                        dictationBusy: dictationBusy
+                    ) else {
+                        selectedDeviceUID = AppConfig.preferredInputDeviceUID ?? ""
+                        deviceStatus = "Stop dictation before changing the input device"
+                        return
+                    }
                     AppConfig.preferredInputDeviceUID = uid.isEmpty ? nil : uid
+                    deviceStatus = ""
                     // The Parakeet daemon pins its mic at launch via --device, so a running
                     // daemon would keep using the old one. Stop it; the next dictation restarts
                     // it on the newly chosen device.
@@ -185,6 +207,11 @@ struct SettingsView: View {
                 Text("Built-in is the default: recording through AirPods would drop their music into call mode.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                if !deviceStatus.isEmpty {
+                    Text(deviceStatus)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
 
             Section("Speech-to-text") {
@@ -195,16 +222,11 @@ struct SettingsView: View {
                 }
                 .pickerStyle(.segmented)
                 .onChange(of: provider) { _, newValue in
-                    // Abandon any session still running on the previous engine before the hotkey
-                    // route changes under it (otherwise: orphaned session, aura stuck, Mac awake).
-                    DictationBridge.cancelActiveSession()
-                    // Switch keys live: persist the selection and load that provider's key.
-                    AppConfig.provider = newValue
+                    // Draft-only selection: the real provider changes only after a
+                    // successful Save & Verify.
                     apiKey = APIKeyStore.loadAPIKey(for: newValue) ?? ""
                     status = ""
-                    // Switching away from Parakeet: shut its daemon down instead of leaving it
-                    // running in the background holding the model in RAM.
-                    if !newValue.isLocal { ParakeetManager.shared.stopDaemon() }
+                    deviceStatus = ""
                 }
 
                 if provider.isLocal {
@@ -216,7 +238,6 @@ struct SettingsView: View {
                     if provider == .elevenLabs {
                         Toggle("Remove filler words (no_verbatim)", isOn: $noVerbatim)
                             .help("Strips “ehm”, false starts and hesitations for a cleaner transcript.")
-                            .onChange(of: noVerbatim) { _, newValue in AppConfig.noVerbatim = newValue }
                     }
 
                     if provider == .deepgram {
@@ -225,9 +246,6 @@ struct SettingsView: View {
                                 Text(lang.label).tag(lang.code)
                             }
                         }
-                        // Persist immediately so the choice sticks without needing Save & Verify
-                        // (it used to revert to the default on reopen).
-                        .onChange(of: language) { _, newValue in AppConfig.language = newValue }
                         .help("Deepgram assumes English without this — pick your language, or Multilingual to mix languages in one phrase. ElevenLabs auto-detects.")
                     }
 
@@ -246,14 +264,10 @@ struct SettingsView: View {
                     .font(.system(size: 12, design: .monospaced))
                     .frame(height: 90)
                     .overlay(RoundedRectangle(cornerRadius: 6).stroke(.secondary.opacity(0.3)))
-                    // Persist on every edit, like every other field here. Otherwise keyterms
-                    // typed without then pressing "Save & Verify" are silently lost on close.
-                    .onChange(of: keyterms) { _, v in AppConfig.saveKeytermsRaw(v) }
             }
 
             Section("AI cleanup") {
                 Toggle("Clean up transcript with AI (Gemini)", isOn: $ppEnabled)
-                    .onChange(of: ppEnabled) { _, v in AppConfig.postProcessEnabled = v }
                 Text("Runs after every engine (including on-device Parakeet). On any error the raw transcript is pasted, so dictation is never lost.")
                     .font(.caption).foregroundStyle(.secondary)
 
@@ -263,7 +277,7 @@ struct SettingsView: View {
                         Text("Vertex (service account)").tag(GeminiAuthMethod.vertex)
                     }
                     .pickerStyle(.segmented)
-                    .onChange(of: ppAuth) { _, v in AppConfig.geminiAuthMethod = v; ppStatus = "" }
+                    .onChange(of: ppAuth) { _, _ in ppStatus = "" }
 
                     if ppAuth == .apiKey {
                         SecureField("Gemini API key", text: $geminiKey)
@@ -276,12 +290,6 @@ struct SettingsView: View {
                                 Text("Region")
                                 TextField("us-central1", text: $vertexRegion)
                                     .textFieldStyle(.roundedBorder)
-                                    // Persist on every edit, not only on Return — a Tab-away or
-                                    // window close after editing must not drop the region. Trim so a
-                                    // stray space/newline can't later break the Vertex URL.
-                                    .onChange(of: vertexRegion) { _, v in
-                                        AppConfig.vertexRegion = v.trimmingCharacters(in: .whitespacesAndNewlines)
-                                    }
                             }
                         }
                     }
@@ -291,7 +299,6 @@ struct SettingsView: View {
                             Text(m.displayName).tag(m)
                         }
                     }
-                    .onChange(of: ppModel) { _, v in AppConfig.postProcessModel = v }
 
                     VStack(alignment: .leading, spacing: 4) {
                         Text("Prompt").font(.caption).foregroundStyle(.secondary)
@@ -300,7 +307,7 @@ struct SettingsView: View {
                             .frame(height: 110)
                             .overlay(RoundedRectangle(cornerRadius: 6).stroke(.secondary.opacity(0.3)))
                         HStack {
-                            Button("Reset to default") { ppPrompt = PostProcessDefaults.prompt; AppConfig.postProcessPrompt = ppPrompt }
+                            Button("Reset to default") { ppPrompt = PostProcessDefaults.prompt }
                             Spacer()
                         }
                     }
@@ -352,6 +359,11 @@ struct SettingsView: View {
         launchAtLogin = SMAppService.mainApp.status == .enabled
         accessibilityGranted = AXIsProcessTrusted()
         micStatus = AVCaptureDevice.authorizationStatus(for: .audio)
+        deviceStatus = ""
+        vertexServiceAccountJSON = SettingsDraftMerger.refreshedVertexServiceAccountJSON(
+            currentDraft: vertexServiceAccountJSON,
+            persisted: LLMCredentialStore.loadVertexServiceAccountJSON()
+        )
         rebuildDeviceList()
     }
 
@@ -375,8 +387,9 @@ struct SettingsView: View {
         let service = SMAppService.mainApp
         do {
             if on { try service.register() } else { try service.unregister() }
+            launchAtLoginStatus = on ? "✓ Launch at login enabled" : "✓ Launch at login disabled"
         } catch {
-            NSSound.beep()
+            launchAtLoginStatus = "⚠️ Couldn't update launch at login (\(error.localizedDescription))"
         }
         launchAtLogin = service.status == .enabled
     }
@@ -427,46 +440,93 @@ struct SettingsView: View {
             ppStatus = "✗ Not a service-account JSON (missing project_id/client_email)"
             return
         }
-        LLMCredentialStore.saveVertexServiceAccountJSON(text)
+        vertexServiceAccountJSON = text
+        ppAuth = .vertex
         vertexProject = account.projectID
-        AppConfig.vertexProject = account.projectID
-        ppStatus = "✓ Service account loaded — project \(account.projectID)"
+        ppStatus = "✓ Service account loaded — ready to verify"
     }
 
     private func saveAndVerifyGemini() {
-        AppConfig.postProcessEnabled = ppEnabled
-        AppConfig.geminiAuthMethod = ppAuth
-        AppConfig.postProcessModel = ppModel
-        AppConfig.postProcessPrompt = ppPrompt
-        AppConfig.vertexProject = vertexProject
-        AppConfig.vertexRegion = vertexRegion.trimmingCharacters(in: .whitespacesAndNewlines)
-        if ppAuth == .apiKey { LLMCredentialStore.saveGeminiAPIKey(geminiKey) }
+        let selectedAuth = ppAuth
+        ppVerificationGeneration &+= 1
+        let generation = ppVerificationGeneration
+        ppVerificationTask?.cancel()
         ppStatus = "Verifying…"
-        let settings = AppConfig.postProcessSettings()
+        let settings = PostProcessSettings(
+            enabled: ppEnabled,
+            authMethod: selectedAuth,
+            model: ppModel,
+            prompt: ppPrompt,
+            vertexProject: vertexProject,
+            vertexRegion: vertexRegion.trimmingCharacters(in: .whitespacesAndNewlines)
+        )
         let key = geminiKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        Task {
-            let result = await GeminiKeyCheck.check(settings: settings, apiKey: key)
-            await MainActor.run { ppStatus = result }
+        ppVerificationTask = Task {
+            let result = await GeminiKeyCheck.check(
+                settings: settings,
+                apiKey: key,
+                serviceAccountJSON: vertexServiceAccountJSON
+            )
+            await MainActor.run {
+                guard generation == ppVerificationGeneration else { return }
+                SettingsSaveCoordinator.commitIfVerified(result) {
+                    AppConfig.postProcessEnabled = ppEnabled
+                    AppConfig.geminiAuthMethod = selectedAuth
+                    AppConfig.postProcessModel = ppModel
+                    AppConfig.postProcessPrompt = ppPrompt
+                    AppConfig.vertexProject = vertexProject
+                    AppConfig.vertexRegion = settings.vertexRegion
+                    if selectedAuth == .apiKey {
+                        LLMCredentialStore.saveGeminiAPIKey(key)
+                    } else {
+                        LLMCredentialStore.saveVertexServiceAccountJSON(vertexServiceAccountJSON)
+                    }
+                }
+                ppStatus = result
+                ppVerificationTask = nil
+            }
         }
     }
 
     private func saveAndVerify() {
+        let selectedProvider = provider
         let key = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        AppConfig.provider = provider
-        APIKeyStore.saveAPIKey(key, for: provider)
-        AppConfig.saveKeytermsRaw(keyterms)
-        AppConfig.noVerbatim = noVerbatim
-        AppConfig.language = language
-        // Only ElevenLabs has a lightweight key-check endpoint we use; for Deepgram we
-        // just confirm the save (a bad key surfaces as an error on first dictation).
-        guard provider == .elevenLabs else {
-            status = key.isEmpty ? "✗ Empty key" : "✓ Saved"
+        if SettingsInteractionPolicy.shouldBlockProviderCommit(
+            current: AppConfig.provider,
+            selected: selectedProvider,
+            dictationBusy: !DictationBridge.canSwitchProvider()
+        ) {
+            status = "Stop dictation before switching providers"
             return
         }
+        sttVerificationGeneration &+= 1
+        let generation = sttVerificationGeneration
+        sttVerificationTask?.cancel()
         status = "Verifying…"
-        Task {
-            let result = await ElevenLabsKeyCheck.check(key)
-            await MainActor.run { status = result }
+        sttVerificationTask = Task {
+            let result: String
+            switch selectedProvider {
+            case .elevenLabs:
+                result = await ElevenLabsKeyCheck.check(key)
+            case .deepgram:
+                result = await DeepgramKeyCheck.check(key)
+            case .parakeetLocal:
+                result = STTSettingsSaveCoordinator.verificationResult(for: selectedProvider)
+            }
+            await MainActor.run {
+                guard generation == sttVerificationGeneration else { return }
+                SettingsSaveCoordinator.commitIfVerified(result) {
+                    AppConfig.provider = selectedProvider
+                    if STTSettingsSaveCoordinator.shouldPersistAPIKey(for: selectedProvider) {
+                        APIKeyStore.saveAPIKey(key, for: selectedProvider)
+                    }
+                    AppConfig.saveKeytermsRaw(keyterms)
+                    AppConfig.noVerbatim = noVerbatim
+                    AppConfig.language = language
+                }
+                status = result
+                sttVerificationTask = nil
+            }
         }
     }
 }
@@ -479,26 +539,43 @@ private struct MicChoice: Identifiable, Hashable {
     var id: String { uid }
 }
 
+enum SettingsDraftMerger {
+    static func refreshedVertexServiceAccountJSON(currentDraft: String, persisted: String?) -> String {
+        currentDraft.isEmpty ? (persisted ?? "") : currentDraft
+    }
+}
+
 enum GeminiKeyCheck {
     /// Sends a tiny real request through the configured processor; a non-throwing round-trip
     /// means the credential + endpoint work. Returns a short human-readable status.
-    static func check(settings: PostProcessSettings, apiKey: String) async -> String {
+    static func check(
+        settings: PostProcessSettings,
+        apiKey: String,
+        serviceAccountJSON: String? = nil
+    ) async -> String {
+        let session = verificationSession()
         let processor: TextPostProcessor
         switch settings.authMethod {
         case .apiKey:
             guard !apiKey.isEmpty else { return "✗ Empty key" }
-            processor = GeminiPostProcessor(model: settings.model, prompt: "Reply with: ok", auth: .apiKey(apiKey))
+            processor = GeminiPostProcessor(
+                model: settings.model,
+                prompt: "Reply with: ok",
+                auth: .apiKey(apiKey),
+                session: session
+            )
         case .vertex:
-            guard let json = LLMCredentialStore.loadVertexServiceAccountJSON(),
+            guard let json = serviceAccountJSON ?? LLMCredentialStore.loadVertexServiceAccountJSON(),
                   let account = ServiceAccount(json: json), !settings.vertexProject.isEmpty else {
                 return "✗ Pick a service-account JSON first"
             }
-            let auth = GoogleServiceAccountAuth(account: account)
+            let auth = GoogleServiceAccountAuth(account: account, session: session)
             processor = GeminiPostProcessor(
                 model: settings.model, prompt: "Reply with: ok",
                 auth: .vertex(token: { try await auth.accessToken() },
                               project: settings.vertexProject,
-                              region: settings.vertexRegion.isEmpty ? PostProcessDefaults.vertexRegion : settings.vertexRegion)
+                              region: settings.vertexRegion.isEmpty ? PostProcessDefaults.vertexRegion : settings.vertexRegion),
+                session: session
             )
         }
         do {
@@ -511,20 +588,51 @@ enum GeminiKeyCheck {
             return "✗ \(Diag.describe(error))"
         }
     }
+
+    private static func verificationSession() -> URLSession {
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = 15
+        config.timeoutIntervalForResource = 20
+        return URLSession(configuration: config)
+    }
 }
 
 enum ElevenLabsKeyCheck {
     /// Validates the key with a lightweight authenticated GET, returning a short
     /// human-readable status. 200 = valid; 401 = wrong key; anything else reports
     /// the status code or network error.
-    static func check(_ key: String) async -> String {
+    static func check(_ key: String, session: URLSession = URLSession(configuration: .ephemeral)) async -> String {
         guard !key.isEmpty, let url = URL(string: "https://api.elevenlabs.io/v1/user") else {
             return "✗ Empty key"
         }
         var req = URLRequest(url: url)
         req.setValue(key, forHTTPHeaderField: "xi-api-key")
+        req.timeoutInterval = 15
         do {
-            let session = URLSession(configuration: .ephemeral)
+            let (_, resp) = try await session.data(for: req)
+            let code = (resp as? HTTPURLResponse)?.statusCode ?? -1
+            switch code {
+            case 200: return "✓ Valid key — saved"
+            case 401: return "✗ Invalid key (401)"
+            default: return "✗ Unexpected response (\(code))"
+            }
+        } catch {
+            return "✗ Network error"
+        }
+    }
+}
+
+enum DeepgramKeyCheck {
+    /// Validates the key with a lightweight authenticated GET against Deepgram's projects API.
+    /// 200 = valid; 401 = wrong key; anything else reports the status code or network error.
+    static func check(_ key: String, session: URLSession = URLSession(configuration: .ephemeral)) async -> String {
+        guard !key.isEmpty, let url = URL(string: "https://api.deepgram.com/v1/projects") else {
+            return "✗ Empty key"
+        }
+        var req = URLRequest(url: url)
+        req.setValue("Token \(key)", forHTTPHeaderField: "Authorization")
+        req.timeoutInterval = 15
+        do {
             let (_, resp) = try await session.data(for: req)
             let code = (resp as? HTTPURLResponse)?.statusCode ?? -1
             switch code {

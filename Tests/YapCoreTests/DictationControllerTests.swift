@@ -114,6 +114,41 @@ final class DictationControllerTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(client.closes, 1)
     }
 
+    func testFinalizeDeliversResultBeforeReturningToIdle() async throws {
+        let capturer = FakeCapturer()
+        let client = ScriptedClient()
+        let controller = DictationController(capturer: capturer, clientFactory: { client }, flushDelaySeconds: 0)
+        let events = TraceLog()
+
+        await controller.setHandlers(
+            onState: { state in
+                switch state {
+                case .idle:
+                    events.append("state:idle")
+                case .listening:
+                    events.append("state:listening")
+                case .finalizing:
+                    events.append("state:finalizing")
+                case .error:
+                    events.append("state:error")
+                }
+            },
+            onResult: { _ in events.append("result") }
+        )
+
+        await controller.toggle()
+        await controller.toggle()
+        client.emit(.committed("ciao mondo"))
+        try await Task.sleep(nanoseconds: 20_000_000)
+
+        let snapshot = events.all
+        guard let resultIndex = snapshot.firstIndex(of: "result"),
+              let idleIndex = snapshot.lastIndex(of: "state:idle") else {
+            return XCTFail("missing expected events: \(snapshot)")
+        }
+        XCTAssertLessThan(resultIndex, idleIndex)
+    }
+
     func testDuplicatePartialDoesNotReemitSameListeningState() async throws {
         let capturer = FakeCapturer()
         let client = ScriptedClient()
@@ -479,4 +514,12 @@ final class ResultBox: @unchecked Sendable {
     func set(_ t: String) { q.sync { v = t; n += 1 } }
     var value: String? { q.sync { v } }
     var count: Int { q.sync { n } }
+}
+
+final class TraceLog: @unchecked Sendable {
+    private let q = DispatchQueue(label: "events")
+    private var items: [String] = []
+
+    func append(_ value: String) { q.sync { items.append(value) } }
+    var all: [String] { q.sync { items } }
 }

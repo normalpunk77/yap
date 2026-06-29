@@ -16,6 +16,7 @@ final class ParakeetControllerTests: XCTestCase {
         var commandCalls: [String] = []
         var startResult = true
         var stopResult = true
+        var stopDaemonCalls = 0
         var onStop: (() -> Void)?
 
         func ensureDaemonRunning() async throws { ensureCalls += 1 }
@@ -26,7 +27,7 @@ final class ParakeetControllerTests: XCTestCase {
             return command == "start" ? startResult : stopResult
         }
 
-        func stopDaemon() {}
+        func stopDaemon() { stopDaemonCalls += 1 }
     }
 
     final class GateManager: ParakeetManaging, @unchecked Sendable {
@@ -86,9 +87,11 @@ final class ParakeetControllerTests: XCTestCase {
         var recordingStates: [Bool] = []
         var deliveredTexts: [String] = []
         var errors: [String] = []
+        var sessionEndedCount = 0
         controller.onRecording = { recordingStates.append($0) }
         controller.onText = { deliveredTexts.append($0) }
         controller.onError = { errors.append($0) }
+        controller.onSessionEnded = { sessionEndedCount += 1 }
 
         await controller.toggle() // start
         await controller.toggle() // stop fails immediately
@@ -97,6 +100,30 @@ final class ParakeetControllerTests: XCTestCase {
         XCTAssertEqual(recordingStates, [true, false])
         XCTAssertTrue(deliveredTexts.isEmpty)
         XCTAssertEqual(errors, ["The local engine failed to stop recording."])
+        XCTAssertEqual(manager.stopDaemonCalls, 1)
+        XCTAssertEqual(sessionEndedCount, 1)
+        XCTAssertFalse(controller.isRecording)
+    }
+
+    func testSuccessfulStopSignalsSessionEndedAfterDeliveryPathCompletes() async throws {
+        let clipboard = FakeClipboard()
+        let manager = FakeManager()
+        manager.onStop = {
+            clipboard.changeCount += 1
+            clipboard.value = "stopped text"
+        }
+        let controller = ParakeetController(manager: manager, clipboard: clipboard)
+
+        var deliveredTexts: [String] = []
+        var sessionEndedCount = 0
+        controller.onText = { deliveredTexts.append($0) }
+        controller.onSessionEnded = { sessionEndedCount += 1 }
+
+        await controller.toggle() // start
+        await controller.toggle() // stop
+
+        XCTAssertEqual(deliveredTexts, ["stopped text"])
+        XCTAssertEqual(sessionEndedCount, 1)
         XCTAssertFalse(controller.isRecording)
     }
 

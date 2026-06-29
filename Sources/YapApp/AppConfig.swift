@@ -3,6 +3,7 @@ import YapCore
 
 /// Non-secret dictation settings, persisted in UserDefaults.
 enum AppConfig {
+    private static let legacyDefaultsBundleID = "com.yap.Yap"
     private static let keytermsKey = "keyterms"
     private static let noVerbatimKey = "no_verbatim"
     private static let providerKey = "stt_provider"
@@ -20,6 +21,20 @@ enum AppConfig {
     private static let keytermsCacheLock = NSLock()
     nonisolated(unsafe) private static var cachedKeytermsRaw = defaultKeytermsRaw
     nonisolated(unsafe) private static var cachedKeyterms = [String]()
+
+    static func migrateLegacyUserDefaults() {
+        guard let legacy = UserDefaults(suiteName: legacyDefaultsBundleID) else { return }
+        migrateLegacyUserDefaults(from: legacy.dictionaryRepresentation())
+    }
+
+    static func migrateLegacyUserDefaults(from legacyValues: [String: Any]) {
+        guard !legacyValues.isEmpty else { return }
+
+        let defaults = UserDefaults.standard
+        for (key, value) in legacyValues where defaults.object(forKey: key) == nil {
+            defaults.set(value, forKey: key)
+        }
+    }
 
     // MARK: Dictation hotkey
 

@@ -10,12 +10,23 @@ enum HotKeyBridge {
     static var apply: (HotKeyShortcut) -> Bool = { _ in false }
 }
 
-/// Lets Settings tell the app to abandon any in-flight dictation when the provider changes —
-/// otherwise a session running on the OLD engine is orphaned (the hotkey now routes elsewhere),
-/// leaving the aura stuck on and the Mac pinned awake. AppDelegate wires `cancelActiveSession`.
+/// Lets Settings ask the app whether a provider switch is safe. The app vetoes the switch while
+/// a dictation is starting or active so Settings does not orphan or discard text in flight.
 @MainActor
 enum DictationBridge {
-    static var cancelActiveSession: () -> Void = {}
+    static var canSwitchProvider: () -> Bool = { true }
+}
+
+enum SettingsInteractionPolicy {
+    static func shouldBlockInputDeviceChange(providerIsLocal: Bool, dictationBusy: Bool) -> Bool {
+        providerIsLocal && dictationBusy
+    }
+
+    static func shouldBlockProviderCommit(current: TranscriptionProvider,
+                                          selected: TranscriptionProvider,
+                                          dictationBusy: Bool) -> Bool {
+        selected != current && dictationBusy
+    }
 }
 
 /// Registers a single global hotkey via Carbon and calls `onTrigger` when pressed. The

@@ -47,6 +47,7 @@ public actor DictationController {
     private var committedText = ""
     private var partial = ""
     public private(set) var state: DictationState = .idle
+    private var finishing = false
 
     // `trailingCaptureSeconds`: keep the mic running this long AFTER the user hits stop, before
     // closing capture — so a word spoken right up to the keypress is still recorded (the audio
@@ -299,16 +300,21 @@ public actor DictationController {
         // Deliver EXACTLY once. This is reachable from two triggers — the `.committed`
         // handler and the finalize timeout (`forceFinish`). Because `teardown()` below
         // suspends, a second trigger could otherwise re-enter while we're still
-        // `.finalizing` and paste the transcript twice. Leaving `.finalizing`
-        // synchronously here — before any `await` — makes any re-entrant call a no-op.
-        guard case .finalizing = state else { return }
+        // `.finalizing` and paste the transcript twice. The `finishing` latch makes any
+        // re-entrant call a no-op before the first one reaches the suspension point.
+        guard case .finalizing = state, !finishing else { return }
+        finishing = true
+        defer { finishing = false }
         // Deliver committed text PLUS any uncommitted trailing partial. Using only
         // committedText here dropped the last words when the final commit didn't arrive
         // before the timeout — the "it doesn't always paste the tail" bug.
         let result = displayText.trimmingCharacters(in: .whitespacesAndNewlines)
-        setState(.idle)
         await teardown()
-        if !result.isEmpty { onResult?(result) }
+        if !result.isEmpty {
+            let handler = onResult
+            await MainActor.run { handler?(result) }
+        }
+        setState(.idle)
     }
 
     private func teardown() async {

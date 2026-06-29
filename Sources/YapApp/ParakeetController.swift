@@ -48,6 +48,10 @@ final class ParakeetController {
     /// The finished transcript, for the owner to post-process + paste. Replaces the old direct
     /// paste so the local engine shares the cloud delivery path.
     var onText: ((String) -> Void)?
+    /// Signals that the stop lifecycle finished, whether it produced text or not. The app uses
+    /// this to keep provider switching and quit/shutdown blocked until the daemon poller has
+    /// actually settled.
+    var onSessionEnded: (() -> Void)?
 
     func toggle() async {
         if starting { return }
@@ -57,6 +61,7 @@ final class ParakeetController {
     /// Abandon an in-flight session WITHOUT delivering — used when the provider is changed under
     /// us, so a recording started on the local engine isn't left orphaned. Safe when idle.
     func cancel() async {
+        defer { onSessionEnded?() }
         pollTask?.cancel()
         pollTask = nil
         guard recording else { return }
@@ -102,6 +107,7 @@ final class ParakeetController {
     }
 
     private func stop() async {
+        defer { onSessionEnded?() }
         recording = false
         // Recording has ended — drop the aura (and the level meter) immediately, regardless of
         // whether any speech was captured. Otherwise a press-without-speaking left the aura lit
@@ -109,6 +115,7 @@ final class ParakeetController {
         onRecording?(false)
         let countBefore = clipboard.changeCount
         guard manager.sendDaemonCommand("stop") else {
+            manager.stopDaemon()
             onError?("The local engine failed to stop recording.")
             return
         }
