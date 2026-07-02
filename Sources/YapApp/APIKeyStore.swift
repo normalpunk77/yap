@@ -23,35 +23,25 @@ enum APIKeyStore {
     }
     private static let account = "api-key"
 
-    static func saveAPIKey(_ value: String, for provider: TranscriptionProvider) {
-        let base: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service(for: provider),
-            kSecAttrAccount as String: account,
-        ]
-        SecItemDelete(base as CFDictionary)   // upsert: clear any existing, then add
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }   // empty = cleared (opt out)
-        var add = base
-        add[kSecValueData as String] = Data(trimmed.utf8)
-        // Foreground dictation app: no need to reach the key while the screen is locked.
-        add[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlocked
-        SecItemAdd(add as CFDictionary, nil)
+    /// Persist (or, with an empty value, remove) the provider's key. Returns false when
+    /// the Keychain refused the operation — the UI surfaces that instead of showing a
+    /// green check over a key that was never stored.
+    @discardableResult
+    static func saveAPIKey(_ value: String, for provider: TranscriptionProvider) -> Bool {
+        KeychainStore.save(value, service: service(for: provider), account: account)
     }
 
     static func loadAPIKey(for provider: TranscriptionProvider) -> String? {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service(for: provider),
-            kSecAttrAccount as String: account,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne,
-        ]
-        var item: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
-              let data = item as? Data,
-              let value = String(data: data, encoding: .utf8), !value.isEmpty else { return nil }
-        return value
+        if case .found(let value) = readAPIKey(for: provider) { return value }
+        return nil
+    }
+
+    /// Full outcome, for callers that must distinguish "no key saved" from "the
+    /// Keychain refused to hand it over" (locked keychain, ACL denied after a
+    /// signature change): telling the user to re-enter a key that IS there was the
+    /// exact confusion this distinction removes.
+    static func readAPIKey(for provider: TranscriptionProvider) -> KeychainStore.ReadOutcome {
+        KeychainStore.read(service: service(for: provider), account: account)
     }
 
     /// Bundle ids the app shipped under before settling on `com.yap`. Their Keychain items use
@@ -70,46 +60,57 @@ enum APIKeyStore {
     /// changed the Keychain service prefix, so a key the user saved under the old name would
     /// silently vanish from the UI after upgrading. Copy any old-name key to the new service
     /// (only when the new slot is empty) and delete the orphan, so existing users keep their key.
+    /// The old item is deleted only once the copy VERIFIABLY landed, and the one-shot flag is
+    /// burned only when every provider migrated cleanly — a locked keychain at first launch
+    /// must not permanently skip the migration.
     static func migrateLegacyKeychainKeys() {
         let defaults = UserDefaults.standard
         guard !defaults.bool(forKey: didMigrateLegacyKeychainKeysFlag) else { return }
+        var fullyMigrated = true
         for provider in [TranscriptionProvider.elevenLabs, .deepgram] {
-            if loadAPIKey(for: provider) != nil { continue }   // already present under com.yap
+            switch readAPIKey(for: provider) {
+            case .found:
+                continue   // already present under com.yap
+            case .failed:
+                fullyMigrated = false   // keychain unavailable — retry next launch
+                continue
+            case .missing:
+                break
+            }
             for prefix in legacyServicePrefixes {
                 guard let old = legacyService(prefix: prefix, for: provider) else { continue }
-                let query: [String: Any] = [
-                    kSecClass as String: kSecClassGenericPassword,
-                    kSecAttrService as String: old,
-                    kSecAttrAccount as String: account,
-                    kSecReturnData as String: true,
-                    kSecMatchLimit as String: kSecMatchLimitOne,
-                ]
-                var item: CFTypeRef?
-                guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
-                      let data = item as? Data,
-                      let value = String(data: data, encoding: .utf8), !value.isEmpty else { continue }
-                saveAPIKey(value, for: provider)   // writes under the new com.yap service
-                SecItemDelete([
-                    kSecClass as String: kSecClassGenericPassword,
-                    kSecAttrService as String: old,
-                    kSecAttrAccount as String: account,
-                ] as CFDictionary)
+                switch KeychainStore.read(service: old, account: account) {
+                case .missing:
+                    continue
+                case .failed:
+                    fullyMigrated = false
+                    continue
+                case .found(let value):
+                    if saveAPIKey(value, for: provider), case .found = readAPIKey(for: provider) {
+                        KeychainStore.delete(service: old, account: account)
+                    } else {
+                        fullyMigrated = false
+                    }
+                }
                 break
             }
         }
-        defaults.set(true, forKey: didMigrateLegacyKeychainKeysFlag)
+        if fullyMigrated { defaults.set(true, forKey: didMigrateLegacyKeychainKeysFlag) }
     }
 
     /// One-time hygiene: wipe any plaintext API keys left in UserDefaults by older builds (the
-    /// keys now live in the Keychain), in both the current and legacy `com.dictabar` domains,
-    /// so no plaintext key lingers on disk.
+    /// keys now live in the Keychain), in the current domain and BOTH legacy domains
+    /// (`com.dictabar` and the pre-rename `io.github.normalpunk77.yap`), so no plaintext key
+    /// lingers on disk.
     static func purgeLegacyPlaintextKeys() {
         let defaults = UserDefaults.standard
         guard !defaults.bool(forKey: didPurgeLegacyPlaintextKeysFlag) else { return }
         let keys = ["elevenlabs-api-key", "deepgram-api-key"]
         for key in keys { UserDefaults.standard.removeObject(forKey: key) }
-        if let legacy = UserDefaults(suiteName: "com.dictabar") {
-            for key in keys { legacy.removeObject(forKey: key) }
+        for domain in ["com.dictabar", "io.github.normalpunk77.yap"] {
+            if let legacy = UserDefaults(suiteName: domain) {
+                for key in keys { legacy.removeObject(forKey: key) }
+            }
         }
         defaults.set(true, forKey: didPurgeLegacyPlaintextKeysFlag)
     }

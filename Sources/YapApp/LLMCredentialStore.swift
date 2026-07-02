@@ -9,39 +9,22 @@ enum LLMCredentialStore {
     private static let geminiKeyService = "com.yap.gemini-api-key"
     private static let vertexSAService = "com.yap.gemini-vertex-sa"
 
-    static func saveGeminiAPIKey(_ value: String) { save(value, service: geminiKeyService) }
+    @discardableResult
+    static func saveGeminiAPIKey(_ value: String) -> Bool {
+        KeychainStore.save(value, service: geminiKeyService, account: account)
+    }
     static func loadGeminiAPIKey() -> String? { load(service: geminiKeyService) }
-    static func saveVertexServiceAccountJSON(_ value: String) { save(value, service: vertexSAService) }
+
+    @discardableResult
+    static func saveVertexServiceAccountJSON(_ value: String) -> Bool {
+        KeychainStore.save(value, service: vertexSAService, account: account)
+    }
     static func loadVertexServiceAccountJSON() -> String? { load(service: vertexSAService) }
 
-    private static func save(_ value: String, service: String) {
-        let base: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-        ]
-        SecItemDelete(base as CFDictionary)
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }   // empty = cleared
-        var add = base
-        add[kSecValueData as String] = Data(trimmed.utf8)
-        // Foreground dictation app: no need to reach the secret while the screen is locked.
-        add[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlocked
-        SecItemAdd(add as CFDictionary, nil)
-    }
-
     private static func load(service: String) -> String? {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne,
-        ]
-        var item: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
-              let data = item as? Data,
-              let value = String(data: data, encoding: .utf8), !value.isEmpty else { return nil }
-        return value
+        if case .found(let value) = KeychainStore.read(service: service, account: account) {
+            return value
+        }
+        return nil
     }
 }

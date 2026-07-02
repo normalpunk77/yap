@@ -74,8 +74,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
                 // The local engine (Parakeet) doesn't use this WebSocket client factory at
                 // all — the hotkey routes it to ParakeetController instead. Guard anyway.
                 guard !provider.isLocal else { throw AppError.localEngineHasNoClient }
-                guard let key = APIKeyStore.loadAPIKey(for: provider), !key.isEmpty else {
+                let key: String
+                switch APIKeyStore.readAPIKey(for: provider) {
+                case .found(let value):
+                    key = value
+                case .missing:
                     throw AppError.missingAPIKey
+                case .failed:
+                    // NOT the same as "no key": the key may well be there but the
+                    // Keychain refused (locked, ACL denied after a signature change).
+                    // Telling the user to enter a key would be a lie.
+                    throw AppError.keychainUnavailable
                 }
                 switch provider {
                 case .parakeetLocal:
@@ -373,12 +382,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
     private static func humanize(_ raw: String) -> String {
         if raw.contains("micDenied") { return "Microphone access denied" }
+        if raw.contains("microphone unavailable") { return "Microphone disconnected — dictation stopped (text so far was pasted)" }
         if raw.contains("tapFailed") || raw.contains("noInput") { return "Microphone unavailable — try again" }
+        if raw.contains("keychainUnavailable") { return "Can't read the API key: the Keychain refused access. Unlock the login keychain (or re-allow access for Yap) and try again." }
         if raw.contains("authenticationFailed") || raw.contains("auth_error") { return "Auth failed — check key" }
+        if raw.contains("HTTP 401") || raw.contains("HTTP 403") { return "The provider rejected the API key — check it in Settings" }
+        if raw.contains("HTTP 429") { return "Rate limited by the provider — wait a moment and retry" }
         if raw.contains("quotaExceeded") { return "Quota exceeded" }
         if raw.contains("rateLimited") { return "Rate limited" }
         if raw.contains("insufficient_audio_activity") { return "No speech detected" }
-        if raw.contains("socketClosed") { return "Connection closed" }
+        if raw.contains("session_time_limit_exceeded") { return "The provider's session limit was reached — text so far was pasted" }
+        if raw.contains("socketClosed") { return "Connection lost — check your internet and try again" }
         if let range = raw.range(of: "HTTP ") {
             // Pull "HTTP <code>" out of a wrapped error like `unknown("HTTP 403")` — the old
             // length guard assumed the bare string and never matched the wrapped form.
@@ -530,7 +544,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private func keyStatusTitle() -> String {
         let provider = AppConfig.provider
         if provider.isLocal { return "On-device engine (Parakeet)" }
-        return APIKeyStore.loadAPIKey(for: provider) == nil ? "No API key set" : "API key set ✓"
+        switch APIKeyStore.readAPIKey(for: provider) {
+        case .found: return "API key set ✓"
+        case .missing: return "No API key set"
+        case .failed: return "API key unreadable (Keychain locked?)"
+        }
     }
 
     private func dictateHintTitle() -> String {
@@ -708,5 +726,5 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         dictationSessionActive = false
     }
 
-    enum AppError: Error { case missingAPIKey, localEngineHasNoClient }
+    enum AppError: Error { case missingAPIKey, keychainUnavailable, localEngineHasNoClient }
 }

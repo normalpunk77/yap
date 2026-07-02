@@ -12,6 +12,7 @@ import OSLog
 /// actually read it.
 public enum Diag {
     public static let conn = Logger(subsystem: "com.yap", category: "connection")
+    public static let app = Logger(subsystem: "com.yap", category: "app")
 
     /// A compact, non-sensitive description of an error (domain/code/message) for logging.
     public static func describe(_ error: Error) -> String {
