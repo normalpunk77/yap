@@ -22,11 +22,16 @@ public struct GeminiPostProcessor: TextPostProcessor {
     private let auth: Auth
     private let session: URLSession
 
-    public init(model: GeminiModel, prompt: String, auth: Auth, session: URLSession = URLSession(configuration: .ephemeral)) {
+    /// One shared session for all cleanups. A processor is built PER DICTATION
+    /// (settings apply without restart), and a URLSession is never reclaimed just by
+    /// deallocation — a fresh ephemeral session per dictation accumulated forever.
+    private static let sharedSession = URLSession(configuration: .ephemeral)
+
+    public init(model: GeminiModel, prompt: String, auth: Auth, session: URLSession? = nil) {
         self.model = model
         self.prompt = prompt
         self.auth = auth
-        self.session = session
+        self.session = session ?? Self.sharedSession
     }
 
     public func process(_ text: String) async throws -> String {

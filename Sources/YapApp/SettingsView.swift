@@ -231,6 +231,18 @@ struct SettingsView: View {
 
                 if provider.isLocal {
                     parakeetSetup
+                    // The picker above is draft-only (nothing commits without an explicit
+                    // action) — without this button the local engine could never become
+                    // the ACTIVE provider: the only commit path lived in the cloud branch.
+                    HStack(spacing: 10) {
+                        Button("Use on-device engine") { saveAndVerify() }
+                            .disabled(!parakeet.isReady)
+                        Text(status).font(.callout).foregroundStyle(.secondary)
+                    }
+                    if !parakeet.isReady {
+                        Text("Finish the setup above, then activate it here.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                 } else {
                     SecureField(provider == .elevenLabs ? "xi-api-key" : "Deepgram API key", text: $apiKey)
                         .textFieldStyle(.roundedBorder)
@@ -238,6 +250,9 @@ struct SettingsView: View {
                     if provider == .elevenLabs {
                         Toggle("Remove filler words (no_verbatim)", isOn: $noVerbatim)
                             .help("Strips “ehm”, false starts and hesitations for a cleaner transcript.")
+                            // Not a credential: persist on change. Behind Save & Verify it
+                            // silently evaporated whenever the user didn't (re)verify a key.
+                            .onChange(of: noVerbatim) { _, on in AppConfig.noVerbatim = on }
                     }
 
                     if provider == .deepgram {
@@ -247,6 +262,7 @@ struct SettingsView: View {
                             }
                         }
                         .help("Deepgram assumes English without this — pick your language, or Multilingual to mix languages in one phrase. ElevenLabs auto-detects.")
+                        .onChange(of: language) { _, code in AppConfig.language = code }
                     }
 
                     HStack(spacing: 10) {
@@ -264,10 +280,19 @@ struct SettingsView: View {
                     .font(.system(size: 12, design: .monospaced))
                     .frame(height: 90)
                     .overlay(RoundedRectangle(cornerRadius: 6).stroke(.secondary.opacity(0.3)))
+                    // Not a credential: persist as typed. It only committed behind a
+                    // successful cloud-key verification — edits were silently lost for
+                    // the local engine (no verify button at all) or on a failed verify.
+                    .onChange(of: keyterms) { _, raw in AppConfig.saveKeytermsRaw(raw) }
             }
 
             Section("AI cleanup") {
                 Toggle("Clean up transcript with AI (Gemini)", isOn: $ppEnabled)
+                    // The on/off switch must stick IMMEDIATELY. It only persisted inside
+                    // a successful Save & Verify — which is hidden when the section
+                    // collapses on OFF — so disabling never stuck and every transcript
+                    // kept flowing to Gemini against the user's explicit choice.
+                    .onChange(of: ppEnabled) { _, on in AppConfig.postProcessEnabled = on }
                 Text("Runs after every engine (including on-device Parakeet). On any error the raw transcript is pasted, so dictation is never lost.")
                     .font(.caption).foregroundStyle(.secondary)
 
@@ -469,6 +494,7 @@ struct SettingsView: View {
             )
             await MainActor.run {
                 guard generation == ppVerificationGeneration else { return }
+                var credentialPersisted = true
                 SettingsSaveCoordinator.commitIfVerified(result) {
                     AppConfig.postProcessEnabled = ppEnabled
                     AppConfig.geminiAuthMethod = selectedAuth
@@ -477,12 +503,13 @@ struct SettingsView: View {
                     AppConfig.vertexProject = vertexProject
                     AppConfig.vertexRegion = settings.vertexRegion
                     if selectedAuth == .apiKey {
-                        LLMCredentialStore.saveGeminiAPIKey(key)
+                        credentialPersisted = LLMCredentialStore.saveGeminiAPIKey(key)
                     } else {
-                        LLMCredentialStore.saveVertexServiceAccountJSON(vertexServiceAccountJSON)
+                        credentialPersisted = LLMCredentialStore.saveVertexServiceAccountJSON(vertexServiceAccountJSON)
                     }
                 }
-                ppStatus = result
+                ppStatus = credentialPersisted ? result
+                    : "⚠️ Verified but the Keychain refused to save the credential — unlock the login keychain and retry"
                 ppVerificationTask = nil
             }
         }
@@ -497,6 +524,15 @@ struct SettingsView: View {
             dictationBusy: !DictationBridge.canSwitchProvider()
         ) {
             status = "Stop dictation before switching providers"
+            return
+        }
+        // Clearing the field + Save = remove the stored key. Verification would just
+        // report "Empty key" and leave the secret in the Keychain forever.
+        if key.isEmpty, !selectedProvider.isLocal,
+           APIKeyStore.loadAPIKey(for: selectedProvider) != nil {
+            status = APIKeyStore.saveAPIKey("", for: selectedProvider)
+                ? "✓ Key removed"
+                : "⚠️ The Keychain refused to remove the key"
             return
         }
         sttVerificationGeneration &+= 1
@@ -515,16 +551,19 @@ struct SettingsView: View {
             }
             await MainActor.run {
                 guard generation == sttVerificationGeneration else { return }
+                var keyPersisted = true
                 SettingsSaveCoordinator.commitIfVerified(result) {
                     AppConfig.provider = selectedProvider
                     if STTSettingsSaveCoordinator.shouldPersistAPIKey(for: selectedProvider) {
-                        APIKeyStore.saveAPIKey(key, for: selectedProvider)
+                        keyPersisted = APIKeyStore.saveAPIKey(key, for: selectedProvider)
                     }
                     AppConfig.saveKeytermsRaw(keyterms)
                     AppConfig.noVerbatim = noVerbatim
                     AppConfig.language = language
                 }
-                status = result
+                // Never show the green check over a key that isn't actually stored.
+                status = keyPersisted ? result
+                    : "⚠️ Key verified but the Keychain refused to save it — unlock the login keychain and retry"
                 sttVerificationTask = nil
             }
         }
@@ -582,8 +621,11 @@ enum GeminiKeyCheck {
             _ = try await processor.process("ping")
             return "✓ Working — saved"
         } catch let e as GeminiPostProcessorError {
-            if case .httpStatus(let code) = e { return "✗ Rejected (HTTP \(code))" }
-            return "✗ Empty response"
+            switch e {
+            case .httpStatus(let code): return "✗ Rejected (HTTP \(code))"
+            case .badURL: return "✗ Invalid Vertex region — check the Region field"
+            case .emptyResponse: return "✗ Empty response"
+            }
         } catch {
             return "✗ \(Diag.describe(error))"
         }

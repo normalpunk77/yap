@@ -511,6 +511,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             window.isReleasedWhenClosed = false
             window.delegate = self
             settingsWindow = window
+        } else if let hosting = settingsWindow?.contentViewController as? NSHostingController<SettingsView>,
+                  settingsWindow?.isVisible != true {
+            // The window is retained across opens, so its SwiftUI @State (drafts,
+            // status strings, provider picker) survives too — reopening showed the
+            // previous session's half-edited state. Start every open from the
+            // CURRENTLY persisted settings.
+            hosting.rootView = SettingsView()
         }
         // Become a regular app while Settings is open so the window can become
         // key and accept keyboard input (accessory apps cannot be active).
