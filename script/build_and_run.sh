@@ -4,17 +4,16 @@ set -euo pipefail
 MODE="${1:-run}"
 APP_NAME="Yap"
 BUILD_PRODUCT="YapApp"
+# Diag logs under this subsystem (see Sources/YapCore/Diagnostics.swift).
+BUNDLE_ID="com.yap"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DIST_DIR="$ROOT_DIR/dist"
-APP_BUNDLE="$DIST_DIR/$APP_NAME.app"
-APP_CONTENTS="$APP_BUNDLE/Contents"
-APP_MACOS="$APP_CONTENTS/MacOS"
-APP_RESOURCES="$APP_CONTENTS/Resources"
-APP_BINARY="$APP_MACOS/$APP_NAME"
-INFO_PLIST="$APP_CONTENTS/Info.plist"
-SOURCE_INFO_PLIST="$ROOT_DIR/Resources/Info.plist"
-SOURCE_ICON="$ROOT_DIR/Resources/AppIcon.icns"
+# Reuse the ONE canonical staging (scripts/build-app.sh): it signs the bundle with the
+# stable "Yap Self-Signed" identity when present. The old private dist/ staging was a
+# SECOND, unsigned copy of the app — a fresh TCC identity every run, competing
+# permission grants, and Keychain re-prompts. One bundle path, one identity.
+APP_BUNDLE="$ROOT_DIR/build/$APP_NAME.app"
+APP_BINARY="$APP_BUNDLE/Contents/MacOS/$APP_NAME"
 
 kill_existing() {
   pkill -x "$APP_NAME" >/dev/null 2>&1 || true
@@ -22,16 +21,7 @@ kill_existing() {
 }
 
 stage_bundle() {
-  local built_binary
-  swift build --configuration debug
-  built_binary="$(swift build --show-bin-path)/$BUILD_PRODUCT"
-  rm -rf "$APP_BUNDLE"
-  mkdir -p "$APP_MACOS"
-  mkdir -p "$APP_RESOURCES"
-  cp "$built_binary" "$APP_BINARY"
-  chmod +x "$APP_BINARY"
-  cp "$SOURCE_INFO_PLIST" "$INFO_PLIST"
-  cp "$SOURCE_ICON" "$APP_RESOURCES/AppIcon.icns"
+  bash "$ROOT_DIR/scripts/build-app.sh" debug
 }
 
 launch_bundle() {

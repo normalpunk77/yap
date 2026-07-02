@@ -24,4 +24,9 @@ if security find-identity -p codesigning 2>/dev/null | grep -q "$SIGN_ID"; then
 else
     codesign --force --sign - --entitlements Resources/Yap.entitlements "$APP"
     echo "Built $APP (signed: ad-hoc)"
+    echo ""
+    echo "⚠️  AD-HOC SIGNATURE: every rebuild gets a DIFFERENT identity, so macOS will"
+    echo "   re-ask Microphone/Accessibility and the Keychain will re-prompt (or refuse)"
+    echo "   access to your stored API keys after each rebuild."
+    echo "   Fix once with:  make signing-identity"
 fi

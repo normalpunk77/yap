@@ -4,7 +4,8 @@
 
 **Yap** is a native macOS dictation app. Press your hotkey, speak, and your words are
 transcribed and pasted at the cursor — in any app. Bring your own speech-to-text API key
-([ElevenLabs](https://elevenlabs.io) or [Deepgram](https://deepgram.com)).
+([ElevenLabs](https://elevenlabs.io) or [Deepgram](https://deepgram.com)), or use the
+optional fully on-device engine (Parakeet) with no key at all.
 
 It stays out of your way in the menu bar (no Dock icon; its only window is Settings) and
 does **one** thing well: set your hotkey, then **press → speak → press** and the text appears
@@ -20,10 +21,14 @@ where you're typing.
 
 - **Customizable global hotkey** — set it to any combo in Settings to start/stop dictation
   anywhere.
-- **Two STT providers**, switchable: ElevenLabs (Scribe v2) and Deepgram (Nova-3).
+- **Three STT engines**, switchable: ElevenLabs (Scribe v2), Deepgram (Nova-3), and an
+  optional fully on-device engine (Parakeet — no key, no network, built locally on opt-in).
+- **Optional AI cleanup** of the transcript via Gemini (bring your own key or Vertex
+  service account); on any error the raw transcript is pasted, never lost.
 - **Language selection** for Deepgram (multilingual code-switching or any single language).
-- **Microphone picker** — defaults to the built-in mic so recording never knocks your
-  AirPods out of music mode into low-quality call mode.
+- **Microphone picker** — a non-Bluetooth choice is always honored; Bluetooth mics are
+  avoided while you're listening on Bluetooth, so recording never knocks your AirPods out
+  of music mode into low-quality call mode.
 - **Custom dictionary** (keyterms) to bias recognition toward names/jargon, on both providers.
 - **Launch at login**, plus in-app buttons for the Microphone and Accessibility permissions.
 - Near-zero CPU when idle (no polling, no background timers).
@@ -73,20 +78,26 @@ launch Settings opens automatically so you can configure it.
 
 1. **Settings → Speech-to-text:** pick a provider, paste your API key, click *Save & Verify*.
 2. **Permissions:** grant **Microphone** (to hear you) and **Accessibility** (to paste).
-   Yap adds itself to *System Settings → Privacy & Security → Accessibility* on first
-   launch — just flip its switch on (no need to add it with `+`).
+   Use the *Grant…* buttons in Settings → Permissions, or wait for the system prompts:
+   the Microphone prompt appears on your first dictation, and Yap appears in
+   *System Settings → Privacy & Security → Accessibility* when it first tries to paste —
+   flip its switch on there.
 3. Put your cursor in any text field, press your dictation hotkey, speak, and press it again.
 
 ## How it works
 
 ```
-hotkey ─▶ AVAudioEngine captures mic ─▶ resample to 16 kHz PCM16
+hotkey ─▶ AVCaptureSession captures your chosen mic ─▶ resample to 16 kHz PCM16
         │
         ▼
    WebSocket to your chosen provider (ElevenLabs / Deepgram) using YOUR key
+   — or the local Parakeet daemon, fully on-device
         │
         ▼
-   transcript ─▶ copied to clipboard ─▶ one synthetic ⌘V pastes it at the cursor
+   transcript ─▶ optional AI cleanup (Gemini, if YOU enabled it)
+        │
+        ▼
+   copied to clipboard ─▶ one synthetic ⌘V pastes it at the cursor ─▶ clipboard restored
 ```
 
 - `Sources/YapApp` — the macOS app: menu bar, Settings UI, mic capture, hotkey, paste.
@@ -100,12 +111,19 @@ Yap is designed to be **legibly trustworthy** — easy to audit by a human, an A
 or a security scanner. The short version:
 
 - **No telemetry, no analytics, no accounts, no auto-update, no phone-home.**
-- **Only two network destinations, ever** — the providers you choose:
-  - `wss://api.elevenlabs.io` / `https://api.elevenlabs.io` (ElevenLabs)
-  - `wss://api.deepgram.com` (Deepgram)
-  Audio streams to them only while you're actively dictating; the one other call is a
-  key-validity check when you click *Save & Verify*. Everything is authenticated with
-  **your** key and goes to the provider **you** chose — there is no other recipient.
+- **Every network destination is one YOU configured**, and each is reached only when its
+  feature is in use:
+  - STT (while dictating, plus the *Save & Verify* key check):
+    `wss://api.elevenlabs.io` / `https://api.elevenlabs.io` (ElevenLabs) or
+    `wss://api.deepgram.com` / `https://api.deepgram.com` (Deepgram).
+  - Optional AI cleanup (only if you enable it): `generativelanguage.googleapis.com`
+    (Gemini API key) or `oauth2.googleapis.com` + `{region}-aiplatform.googleapis.com`
+    (Vertex service account).
+  - Optional on-device engine, one-time setup (only if you click *Set up Parakeet*):
+    `github.com` (clones the engine source) and Hugging Face (downloads the model).
+    Dictation with Parakeet afterwards is fully offline.
+  With cloud STT and no AI cleanup, your audio goes to the ONE provider you chose and
+  nowhere else. There is no other recipient.
 - **It does not read your keystrokes.** Accessibility permission is used *only* to paste:
   the app synthesizes a single `⌘V` ([`Paster.swift`](Sources/YapApp/Paster.swift)).
   There is **no keyboard event tap and no global key monitor** anywhere in the code. The
@@ -113,14 +131,16 @@ or a security scanner. The short version:
   ([`HotKeyManager.swift`](Sources/YapApp/HotKeyManager.swift)), which registers one
   shortcut — it does not observe what you type.
 - **The microphone is only live during a dictation session** (between the two hotkey presses).
-- **Zero third-party dependencies** — only Apple frameworks plus the local Obj-C shim. There
-  is no `Package.resolved` because there is nothing external to resolve. Minimal supply-chain
-  surface.
+- **No third-party Swift dependencies** — only Apple frameworks plus the local Obj-C shim
+  (no `Package.resolved`; nothing external to resolve). The optional Parakeet engine is the
+  one exception you opt into explicitly: its setup clones and builds
+  [`lucataco/parakeet-cli`](https://github.com/lucataco/parakeet-cli) locally and downloads
+  the model — audit that repo separately if you enable it.
 - **Least-privilege entitlements** — the app requests only `device.audio-input`
   ([`Resources/Yap.entitlements`](Resources/Yap.entitlements)).
-- **Your API key is stored in the macOS Keychain** (encrypted, access-controlled — see
-  [`APIKeyStore.swift`](Sources/YapApp/APIKeyStore.swift)), not a plaintext file. It never
-  leaves your machine except to the provider you configured.
+- **Your credentials are stored in the macOS Keychain** (encrypted, access-controlled — see
+  [`APIKeyStore.swift`](Sources/YapApp/APIKeyStore.swift)), not a plaintext file. They never
+  leave your machine except to the provider you configured.
 - **Diagnostic logging is local and non-sensitive.** Yap logs the connection lifecycle
   (provider, WebSocket close codes, network errors, reconnects) to the macOS unified log to
   diagnose dropped streams — never your audio, transcript, or key, and never sent anywhere
@@ -133,7 +153,9 @@ Full threat model, permission rationale, and verification commands are in **[SEC
 Don't take the claims above on faith — verify them in seconds:
 
 ```bash
-# Every network host the code talks to (expect only elevenlabs.io and deepgram.com):
+# Every network host the code talks to (expect: elevenlabs.io, deepgram.com,
+# googleapis.com for the optional AI cleanup, github.com/rustup.rs for the optional
+# on-device engine setup):
 grep -rniE "https?://|wss?://" Sources/
 
 # Prove there's no keystroke logging (expect no matches):
