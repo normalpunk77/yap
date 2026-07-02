@@ -47,11 +47,16 @@ enum AppConfig {
             // Require BOTH halves to be present. The three keys are written separately; a process
             // killed mid-save could leave only the keyCode, yielding a modifier-less shortcut that
             // registers a bare key globally and swallows every press of that character.
-            guard d.object(forKey: hotKeyCodeKey) != nil,
-                  d.object(forKey: hotKeyModsKey) != nil else { return .defaultShortcut }
+            // `UInt32(exactly:)`, NOT the trapping initializer: a negative/oversized integer in
+            // defaults (external edit, corruption) would otherwise crash EVERY launch — the getter
+            // runs during app startup.
+            guard let codeRaw = d.object(forKey: hotKeyCodeKey) as? Int,
+                  let modsRaw = d.object(forKey: hotKeyModsKey) as? Int,
+                  let code = UInt32(exactly: codeRaw),
+                  let mods = UInt32(exactly: modsRaw) else { return .defaultShortcut }
             return HotKeyShortcut(
-                keyCode: UInt32(d.integer(forKey: hotKeyCodeKey)),
-                modifiers: UInt32(d.integer(forKey: hotKeyModsKey)),
+                keyCode: code,
+                modifiers: mods,
                 keyLabel: d.string(forKey: hotKeyLabelKey) ?? "?")
         }
         set {

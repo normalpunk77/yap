@@ -41,9 +41,17 @@ struct ClipboardSnapshot {
         }
     }
 
+    /// Reading a representation MATERIALIZES it, and this runs on the main thread at
+    /// paste time. Bound the work: skip file promises (they resolve lazily — possibly
+    /// off the network — and don't survive a restore anyway) and anything huge, so a
+    /// multi-hundred-MB copy sitting on the clipboard can't beachball every dictation.
+    private static let maxRepresentationBytes = 10 * 1024 * 1024
+
     private static func snapshot(of item: NSPasteboardItem) -> [Representation]? {
         let representations = item.types.compactMap { type -> Representation? in
+            if type.rawValue.hasPrefix("com.apple.pasteboard.promised") { return nil }
             if let data = item.data(forType: type) {
+                guard data.count <= maxRepresentationBytes else { return nil }
                 return Representation(type: type, data: data, string: nil, propertyList: nil)
             }
             if let string = item.string(forType: type) {

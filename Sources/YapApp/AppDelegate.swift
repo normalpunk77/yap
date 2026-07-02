@@ -550,7 +550,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
 
     private func resumeHotKey() {
-        if let active = activeHotKey { hotKey.register(active) }
+        guard let active = activeHotKey else { return }
+        // Another app can claim the combo while ours is suspended (Settings open).
+        // Failing silently here left dictation with NO working hotkey and no clue why.
+        if !hotKey.register(active) {
+            presentHotKeyConflict(active)
+        }
     }
 
     /// Reflects whether the active provider's key is set. Recomputed each time the menu
@@ -680,20 +685,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         let deadline = ContinuousClock.now.advanced(by: .seconds(10))
         var stablePolls = 0
 
-        if AppConfig.provider.isLocal {
-            if parakeetController.isRecording {
-                await parakeetController.toggle()
-            }
-        } else {
-            switch await controller.state {
-            case .listening:
-                await controller.toggle()
-            case .finalizing, .idle, .error:
-                break
-            }
-        }
-
         while ContinuousClock.now < deadline {
+            // Ask the active session to stop INSIDE the loop, not once up front: while a
+            // session is still starting up, toggle() is debounced (no-op) — quitting in
+            // that window used to wait out the whole deadline with the mic hot and the
+            // dictation dropped. Retrying lands the stop the moment startup settles.
+            if AppConfig.provider.isLocal {
+                if parakeetController.isRecording {
+                    await parakeetController.toggle()
+                }
+            } else if case .listening = await controller.state {
+                await controller.toggle()
+            }
             let cloudBusy: Bool
             if AppConfig.provider.isLocal {
                 cloudBusy = parakeetController.isRecording

@@ -97,15 +97,23 @@ final class ShortcutRecorderView: NSView {
     static func keyLabel(for event: NSEvent) -> String {
         if let special = specialKeys[event.keyCode] { return special }
         let chars = (event.charactersIgnoringModifiers ?? "").uppercased()
-        // Drop control characters some keys emit; an empty label is rejected by the caller.
-        return chars.unicodeScalars.allSatisfy { $0.value >= 0x20 } ? chars : ""
+        // Drop control characters AND the 0xF700-0xF8FF function-key private-use area:
+        // unmapped function/navigation keys emit those, which render as INVISIBLE
+        // glyphs — the shortcut worked but Settings and the menu showed a blank label.
+        let printable = chars.unicodeScalars.allSatisfy {
+            $0.value >= 0x20 && !(0xF700 ... 0xF8FF).contains($0.value)
+        }
+        return printable ? chars : ""
     }
 
     private static let specialKeys: [UInt16: String] = [
         49: "Space", 36: "↩", 76: "↩", 48: "⇥", 51: "⌫", 117: "⌦",
         123: "←", 124: "→", 125: "↓", 126: "↑",
+        115: "↖", 119: "↘", 116: "⇞", 121: "⇟",
         122: "F1", 120: "F2", 99: "F3", 118: "F4", 96: "F5", 97: "F6",
         98: "F7", 100: "F8", 101: "F9", 109: "F10", 103: "F11", 111: "F12",
+        105: "F13", 107: "F14", 113: "F15", 106: "F16",
+        64: "F17", 79: "F18", 80: "F19", 90: "F20",
     ]
 
     override func draw(_ dirtyRect: NSRect) {
