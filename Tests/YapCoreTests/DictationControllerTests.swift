@@ -743,6 +743,48 @@ final class DictationControllerTests: XCTestCase {
         XCTAssertEqual(result.value, "second tail")        // tail kept — not clipped early
     }
 
+    func testCaptureFailureSalvagesTranscriptAndSurfacesError() async throws {
+        // The mic can die irrecoverably mid-dictation (device unplugged, session can't
+        // restart). The controller must not sit in `.listening` on a dead mic: salvage
+        // what was dictated, then surface the error.
+        let capturer = FakeCapturer()
+        let client = ScriptedClient()
+        let controller = DictationController(capturer: capturer, clientFactory: { client }, flushDelaySeconds: 0)
+        let result = ResultBox()
+        await controller.setHandlers(onState: { _ in }, onResult: { t in result.set(t) })
+
+        await controller.toggle()                    // listening
+        client.emit(.committed("hello"))
+        try await waitFor { await controller.state == .listening("hello") }
+        await controller.captureFailed()
+
+        XCTAssertEqual(result.value, "hello")        // salvaged
+        let s = await controller.state
+        if case .error = s {} else { XCTFail("expected error state, got \(s)") }
+    }
+
+    func testAudioBacklogIsCappedWhileDisconnected() async throws {
+        // With the socket gone (reconnect backoff) chunks buffer in memory. The backlog
+        // must be bounded — shed the OLDEST — so a wedged connection can't grow forever.
+        let capturer = FakeCapturer()
+        let factory = ClientFactory()
+        let controller = DictationController(capturer: capturer, clientFactory: { factory.make() },
+                                             flushDelaySeconds: 0, reconnectBackoffSeconds: 1.5)
+        await controller.setHandlers(onState: { _ in }, onResult: { _ in })
+
+        await controller.toggle()
+        factory.clients[0].emit(.failed(.socketClosed))   // → reconnect, 1.5s backoff
+        try await Task.sleep(nanoseconds: 50_000_000)     // let the client drop to nil
+        let overCap = DictationController.maxBufferedChunks + 50
+        for i in 0 ..< overCap {                          // buffered, nothing to send to
+            await capturer.onChunk?(Data([UInt8(i % 256)]))
+        }
+        try await waitFor { factory.clients.count == 2 }  // reconnect lands and drains
+        try await waitFor { factory.clients[1].chunks == DictationController.maxBufferedChunks }
+        try await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertEqual(factory.clients[1].chunks, DictationController.maxBufferedChunks)
+    }
+
     func testUnsolicitedCommitAccumulatesAndDoesNotStop() async throws {
         // ElevenLabs auto-commits on pauses / every ~90s. Those segments must be
         // accumulated and the session must keep running — only the user's second

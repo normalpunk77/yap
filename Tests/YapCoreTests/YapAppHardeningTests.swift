@@ -201,9 +201,13 @@ final class AppConfigMigrationTests: XCTestCase {
 }
 
 final class AudioInputDevicesTests: XCTestCase {
-    func testPrefersBuiltinMicWhenOutputIsBluetooth() {
+    // The one combination that audibly hurts the user: engaging a BLUETOOTH mic while
+    // they listen on Bluetooth knocks the headset from A2DP into HFP call mode. The
+    // policy avoids exactly that — and nothing else. A non-Bluetooth mic can never
+    // degrade the headset audio, so an explicit selection of one is ALWAYS honored.
+    func testAvoidsSelectedBluetoothMicWhenOutputIsBluetooth() {
         let devices = [
-            AudioInputDevice(id: 1, uid: "airpods", name: "AirPods", isBuiltIn: false),
+            AudioInputDevice(id: 1, uid: "airpods", name: "AirPods", isBuiltIn: false, isBluetooth: true),
             AudioInputDevice(id: 2, uid: "builtin", name: "Mac mic", isBuiltIn: true)
         ]
 
@@ -245,7 +249,10 @@ final class AudioInputDevicesTests: XCTestCase {
         XCTAssertEqual(uid, "usb")
     }
 
-    func testReturnsNilWhenBluetoothOutputHasNoBuiltinMicToUse() {
+    func testHonorsNonBluetoothSelectionEvenWhenOutputIsBluetooth() {
+        // Regression (Mac mini / Studio + AirPods): a USB/XLR mic can't push the AirPods
+        // into HFP — overriding it (to a built-in mic that doesn't exist there) made
+        // every dictation fail with "no input" for the whole desktop-Mac user class.
         let devices = [
             AudioInputDevice(id: 1, uid: "usb", name: "USB mic", isBuiltIn: false)
         ]
@@ -256,7 +263,55 @@ final class AudioInputDevicesTests: XCTestCase {
             defaultOutputIsBluetooth: true
         )
 
-        XCTAssertNil(uid)
+        XCTAssertEqual(uid, "usb")
+    }
+
+    func testFallsBackToNonBluetoothInputWhenOutputIsBluetoothAndNoBuiltin() {
+        let devices = [
+            AudioInputDevice(id: 1, uid: "airpods", name: "AirPods", isBuiltIn: false, isBluetooth: true),
+            AudioInputDevice(id: 2, uid: "usb", name: "USB mic", isBuiltIn: false)
+        ]
+
+        let uid = AudioInputDevices.preferredDictationInputUID(
+            devices: devices,
+            preferredInputDeviceUID: nil,
+            defaultOutputIsBluetooth: true
+        )
+
+        XCTAssertEqual(uid, "usb")
+    }
+
+    func testUsesBluetoothMicAsLastResortWhenItIsTheOnlyInput() {
+        // A Mac with ONLY AirPods available must still dictate (HFP is unavoidable
+        // there) — failing with "no input" would brick dictation entirely.
+        let devices = [
+            AudioInputDevice(id: 1, uid: "airpods", name: "AirPods", isBuiltIn: false, isBluetooth: true)
+        ]
+
+        let uid = AudioInputDevices.preferredDictationInputUID(
+            devices: devices,
+            preferredInputDeviceUID: nil,
+            defaultOutputIsBluetooth: true
+        )
+
+        XCTAssertEqual(uid, "airpods")
+    }
+
+    func testHonorsBluetoothSelectionWhenOutputIsNotBluetooth() {
+        // Listening on speakers: capturing from an explicitly chosen Bluetooth mic
+        // degrades nothing the user can hear — the explicit choice wins.
+        let devices = [
+            AudioInputDevice(id: 1, uid: "airpods", name: "AirPods", isBuiltIn: false, isBluetooth: true),
+            AudioInputDevice(id: 2, uid: "builtin", name: "Mac mic", isBuiltIn: true)
+        ]
+
+        let uid = AudioInputDevices.preferredDictationInputUID(
+            devices: devices,
+            preferredInputDeviceUID: "airpods",
+            defaultOutputIsBluetooth: false
+        )
+
+        XCTAssertEqual(uid, "airpods")
     }
 }
 

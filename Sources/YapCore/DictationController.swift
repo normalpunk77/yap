@@ -128,6 +128,15 @@ public actor DictationController {
         setState(.idle)
     }
 
+    /// The capturer's input died irrecoverably (device unplugged and no fallback could
+    /// be brought up). Don't sit in `.listening` on a dead mic: salvage what was
+    /// dictated, then surface the error. A `.finalizing` session needs nothing — its
+    /// audio is already captured and the safety timeout bounds the rest.
+    public func captureFailed() async {
+        guard case .listening = state else { return }
+        await failSession("microphone unavailable")
+    }
+
     private var displayText: String {
         let trimmedPartial = partial.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedPartial.isEmpty else { return committedText }
@@ -178,8 +187,26 @@ public actor DictationController {
         }
     }
 
+    /// Memory bound for audio buffered while disconnected: ≈2 minutes of 100 ms frames.
+    /// The reconnect loop gives up long before this in practice; the cap only stops a
+    /// pathologically wedged connection from growing the backlog forever.
+    static let maxBufferedChunks = 1200
+
     private func forwardChunk(_ chunk: Data) async {
         pendingChunks.append(chunk)
+        // Shed the OLDEST audio past the cap — but never while a flush loop is
+        // suspended mid-queue: its shared index must not be yanked out from under it.
+        if !flushing, pendingChunks.count - pendingChunkIndex > Self.maxBufferedChunks {
+            if pendingChunkIndex > 0 {
+                pendingChunks.removeFirst(pendingChunkIndex)
+                pendingChunkIndex = 0
+            }
+            if pendingChunks.count > Self.maxBufferedChunks {
+                let overflow = pendingChunks.count - Self.maxBufferedChunks
+                pendingChunks.removeFirst(overflow)
+                Diag.conn.error("audio backlog exceeded cap — dropped \(overflow) oldest chunk(s)")
+            }
+        }
         guard let client else { return }
         await flushPendingChunks(using: client)
     }

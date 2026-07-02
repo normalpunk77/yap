@@ -9,6 +9,15 @@ struct AudioInputDevice: Identifiable, Hashable {
     let uid: String
     let name: String
     let isBuiltIn: Bool
+    let isBluetooth: Bool
+
+    init(id: AudioDeviceID, uid: String, name: String, isBuiltIn: Bool, isBluetooth: Bool = false) {
+        self.id = id
+        self.uid = uid
+        self.name = name
+        self.isBuiltIn = isBuiltIn
+        self.isBluetooth = isBluetooth
+    }
 }
 
 /// Enumerates and resolves audio input devices via Core Audio. Single home for the
@@ -22,11 +31,14 @@ enum AudioInputDevices {
                   let uid = stringProperty(device, kAudioDevicePropertyDeviceUID),
                   let name = stringProperty(device, kAudioObjectPropertyName)
             else { return nil }
+            let transport = transportType(device)
             return AudioInputDevice(
                 id: device,
                 uid: uid,
                 name: name,
-                isBuiltIn: transportType(device) == kAudioDeviceTransportTypeBuiltIn)
+                isBuiltIn: transport == kAudioDeviceTransportTypeBuiltIn,
+                isBluetooth: transport == kAudioDeviceTransportTypeBluetooth
+                    || transport == kAudioDeviceTransportTypeBluetoothLE)
         }
     }
 
@@ -60,21 +72,28 @@ enum AudioInputDevices {
         all().first { $0.uid == uid }?.id
     }
 
-    /// Choose the dictation input UID without touching Core Audio state. When the user is
-    /// listening on Bluetooth output, prefer the built-in mic so we do not push AirPods into
-    /// call mode. Otherwise honor a valid persisted selection and fall back to the built-in mic
-    /// or the first available input.
+    /// Choose the dictation input UID without touching Core Audio state.
+    ///
+    /// The ONE combination to avoid: capturing from a BLUETOOTH mic while the user
+    /// listens on Bluetooth — that knocks the headset from music mode (A2DP) into call
+    /// mode (HFP) and audibly degrades what they're hearing. A built-in/USB/wired mic
+    /// can never do that, so an explicit non-Bluetooth selection is ALWAYS honored.
+    /// (The old rule blindly forced the built-in mic whenever output was Bluetooth:
+    /// on a Mac mini/Studio — no built-in mic — that returned nil and every dictation
+    /// failed, and on laptops it silently overrode a perfectly safe USB selection.)
     static func preferredDictationInputUID(devices: [AudioInputDevice],
                                            preferredInputDeviceUID: String?,
                                            defaultOutputIsBluetooth: Bool) -> String? {
-        if defaultOutputIsBluetooth {
-            return devices.first(where: { $0.isBuiltIn })?.uid
+        let selected = preferredInputDeviceUID.flatMap { uid in devices.first { $0.uid == uid } }
+        if let selected, !(defaultOutputIsBluetooth && selected.isBluetooth) {
+            return selected.uid
         }
-        if let preferredInputDeviceUID,
-           devices.contains(where: { $0.uid == preferredInputDeviceUID }) {
-            return preferredInputDeviceUID
-        }
-        return devices.first(where: { $0.isBuiltIn })?.uid ?? devices.first?.uid
+        // No usable selection: prefer the built-in mic, then any non-Bluetooth input.
+        // A Bluetooth mic is the LAST resort (a Mac whose only input is the AirPods
+        // must still dictate — HFP is unavoidable there, failing would be worse).
+        let builtIn = devices.first { $0.isBuiltIn }
+        let nonBluetooth = devices.first { !$0.isBluetooth }
+        return (builtIn ?? nonBluetooth ?? devices.first)?.uid
     }
 
     /// Production wrapper for the active dictation input policy.

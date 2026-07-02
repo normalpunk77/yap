@@ -111,6 +111,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         micCapture.onLevel = { [weak self] level in
             DispatchQueue.main.async { [weak self] in self?.edgeGlow.updateLevel(level) }
         }
+        // The input died irrecoverably mid-dictation (mic unplugged, no fallback came
+        // up): end the session — salvaging the text dictated so far — instead of
+        // sitting in `.listening` on a dead microphone.
+        micCapture.onCaptureFailure = { [weak self] in
+            guard let self else { return }
+            Task { await self.controller.captureFailed() }
+        }
 
         Task {
             await controller.setHandlers(

@@ -17,26 +17,69 @@ private actor FlushWaitState {
     func isTimedOut() -> Bool { timedOut }
 }
 
+/// Concurrency model — three domains touch this object, so every bit of shared
+/// mutable state is confined or locked:
+///  - `sessionQueue` (serial) owns ALL AVCaptureSession mutations: configure, start,
+///    stop, recovery. Nothing else calls into the session, so a stop can never
+///    interleave with a route-change restart (that interleaving used to leave the mic
+///    engaged after dictation ended — orange dot stuck on).
+///  - `outputQueue` (serial) receives the capture callbacks; it only READS the shared
+///    flags/closures (via `stateLock`) and owns `converter`/`targetFormat`.
+///  - Callers (actor executor threads) go through `stateLock` for the flags and hop
+///    onto `sessionQueue` for session work. In particular `stop()` detaches the
+///    delegate and stops the session BEFORE releasing `chunkContinuation` — nilling a
+///    strong var while the delegate thread still yields into it was an ARC race
+///    (intermittent over/under-release crashes).
 final class MicrophoneCapture: NSObject, AudioCapturer, AVCaptureAudioDataOutputSampleBufferDelegate, @unchecked Sendable {
-    /// Optional live input level in 0...1, emitted per audio buffer (off the main
-    /// thread). Set before `start`; used to drive the HUD waveform.
-    var onLevel: (@Sendable (Double) -> Void)?
-
     private let session = AVCaptureSession()
+    private let sessionQueue = DispatchQueue(label: "com.yap.microphone-capture.session")
     private let outputQueue = DispatchQueue(label: "com.yap.microphone-capture.output")
+    private let stateLock = NSLock()
     private let targetRate: Double = 16000
+
+    // outputQueue-confined (rebuilt from the first buffer's REAL format; the live
+    // hardware rate can differ from what we read at start and can change mid-stream).
     private var converter: AVAudioConverter?
     private var targetFormat: AVAudioFormat!
-    // Audio chunks flow through ONE ordered stream. The capture delegate only enqueues;
-    // a single consumer task awaits `onChunk` strictly in order.
-    private var chunkContinuation: AsyncStream<Data>.Continuation?
-    private var deliveryTask: Task<Void, Never>?
-    // Tracks whether capture is active regardless of whether we are actually delivering
-    // chunks. Route-change recovery needs this in level-only meter mode too.
-    private var sessionActive = false
+
+    // stateLock-guarded.
+    private var _onLevel: (@Sendable (Double) -> Void)?
+    private var _onCaptureFailure: (@Sendable () -> Void)?
+    private var _chunkContinuation: AsyncStream<Data>.Continuation?
+    private var _sessionActive = false
+    private var configObservers: [NSObjectProtocol] = []
+
+    // sessionQueue-confined.
     private var activeInput: AVCaptureDeviceInput?
     private var activeOutput: AVCaptureAudioDataOutput?
-    private var configObservers: [NSObjectProtocol] = []
+
+    // Caller-side only (the controller actor serializes start/flush-wait/stop).
+    private var deliveryTask: Task<Void, Never>?
+
+    /// Optional live input level in 0...1, emitted per audio buffer (off the main
+    /// thread). Set before `start`; used to drive the HUD waveform.
+    var onLevel: (@Sendable (Double) -> Void)? {
+        get { stateLock.withLock { _onLevel } }
+        set { stateLock.withLock { _onLevel = newValue } }
+    }
+
+    /// Fired (once, off the main thread) when capture dies irrecoverably mid-session —
+    /// the input device vanished and no fallback could be brought up. Lets the owner
+    /// end the dictation instead of listening forever to a dead mic.
+    var onCaptureFailure: (@Sendable () -> Void)? {
+        get { stateLock.withLock { _onCaptureFailure } }
+        set { stateLock.withLock { _onCaptureFailure = newValue } }
+    }
+
+    private var chunkContinuation: AsyncStream<Data>.Continuation? {
+        get { stateLock.withLock { _chunkContinuation } }
+        set { stateLock.withLock { _chunkContinuation = newValue } }
+    }
+
+    private var sessionActive: Bool {
+        get { stateLock.withLock { _sessionActive } }
+        set { stateLock.withLock { _sessionActive = newValue } }
+    }
 
     func start(onChunk: @escaping @Sendable (Data) async -> Void) async throws {
         try await start(onChunk: onChunk, deliverChunks: true)
@@ -46,16 +89,21 @@ final class MicrophoneCapture: NSObject, AudioCapturer, AVCaptureAudioDataOutput
                deliverChunks: Bool) async throws {
         try await requestPermission()
 
-        targetFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32,
-                                     sampleRate: targetRate,
-                                     channels: 1,
-                                     interleaved: false)!
-        // Built lazily from the first buffer's REAL format. The live hardware rate can
-        // differ from what we read here and can change mid-stream.
-        converter = nil
+        // Publish the per-session conversion state through the callback queue so the
+        // delegate never sees a half-initialized converter setup.
+        let format = AVAudioFormat(commonFormat: .pcmFormatFloat32,
+                                   sampleRate: targetRate,
+                                   channels: 1,
+                                   interleaved: false)!
+        outputQueue.sync {
+            targetFormat = format
+            converter = nil
+        }
 
         if deliverChunks {
-            let (stream, cont) = AsyncStream<Data>.makeStream(bufferingPolicy: .unbounded)
+            // Bounded buffer: if the consumer ever wedges, drop the newest instead of
+            // growing without limit (1024 ≈ far beyond any real drain hiccup).
+            let (stream, cont) = AsyncStream<Data>.makeStream(bufferingPolicy: .bufferingOldest(1024))
             chunkContinuation = cont
             // Coalesce the small per-buffer chunks into ~100 ms frames before sending:
             // fewer frames mean fewer JSON/base64 encodes and WS sends.
@@ -73,37 +121,65 @@ final class MicrophoneCapture: NSObject, AudioCapturer, AVCaptureAudioDataOutput
             }
         }
 
-        do {
-            try configureSession()
-            session.startRunning()
-        } catch {
-            chunkContinuation?.finish()
+        let configError: Error? = await withCheckedContinuation { continuation in
+            sessionQueue.async { [self] in
+                do {
+                    try configureSession()
+                    session.startRunning()
+                    continuation.resume(returning: nil)
+                } catch {
+                    teardownSessionConfiguration()
+                    continuation.resume(returning: error)
+                }
+            }
+        }
+        if let configError {
+            let cont = chunkContinuation
             chunkContinuation = nil
+            cont?.finish()
             deliveryTask = nil
-            teardownSessionConfiguration()
-            throw error
+            throw configError
         }
 
         sessionActive = true
         installObservers()
     }
 
-    /// Resume capture after the session stopped on a configuration change or runtime error.
-    /// No-op if the session is already running. If it can't be restarted, end the chunk stream
-    /// so the session stops cleanly rather than hanging on a dead microphone.
-    private func restartAfterRouteChange() {
-        guard sessionActive, !session.isRunning else { return }
-        do {
-            try configureSession()
-            session.startRunning()
-        } catch {
-            chunkContinuation?.finish()
-            chunkContinuation = nil
-            deliveryTask = nil
-            sessionActive = false
+    /// Re-evaluate the input after a device/route event, on the session queue. Covers:
+    /// the selected mic vanished (fall back per policy), the user's preferred mic came
+    /// back (honor the choice again), or the session died on a runtime error (restart).
+    /// If no input can be brought up at all, end the chunk stream and report the
+    /// failure so the session stops cleanly rather than hanging on a dead microphone.
+    private func scheduleSessionRecovery() {
+        sessionQueue.async { [self] in
+            guard sessionActive else { return }
+            let wantedUID = AudioInputDevices.preferredDictationInputUID()
+            let currentUID = activeInput?.device.uniqueID
+            if session.isRunning, let wantedUID, wantedUID == currentUID { return }
+            do {
+                try configureSession()
+                session.startRunning()
+            } catch {
+                Diag.conn.error("mic recovery failed — ending capture: \(Diag.describe(error), privacy: .public)")
+                failCapture()
+            }
         }
     }
 
+    /// sessionQueue-only. Irrecoverable input loss: stop delivering, tell the owner.
+    private func failCapture() {
+        let (cont, failureHandler): (AsyncStream<Data>.Continuation?, (@Sendable () -> Void)?) =
+            stateLock.withLock {
+                let c = _chunkContinuation
+                _chunkContinuation = nil
+                _sessionActive = false
+                return (c, _onCaptureFailure)
+            }
+        cont?.finish()
+        failureHandler?()
+    }
+
+    /// sessionQueue-only.
     private func configureSession() throws {
         session.stopRunning()
         session.beginConfiguration()
@@ -129,6 +205,7 @@ final class MicrophoneCapture: NSObject, AudioCapturer, AVCaptureAudioDataOutput
         activeOutput = output
     }
 
+    /// sessionQueue-only.
     private func teardownSessionConfiguration() {
         if let activeOutput {
             activeOutput.setSampleBufferDelegate(nil, queue: nil)
@@ -144,23 +221,37 @@ final class MicrophoneCapture: NSObject, AudioCapturer, AVCaptureAudioDataOutput
     private func installObservers() {
         removeObservers()
         let center = NotificationCenter.default
-        configObservers = [
-            center.addObserver(forName: .AVCaptureSessionRuntimeError, object: session, queue: .main) { [weak self] _ in
-                self?.restartAfterRouteChange()
+        let observers = [
+            center.addObserver(forName: .AVCaptureSessionRuntimeError, object: session, queue: nil) { [weak self] _ in
+                self?.scheduleSessionRecovery()
             },
-            center.addObserver(forName: .AVCaptureSessionInterruptionEnded, object: session, queue: .main) { [weak self] _ in
-                self?.restartAfterRouteChange()
+            center.addObserver(forName: .AVCaptureSessionInterruptionEnded, object: session, queue: nil) { [weak self] _ in
+                self?.scheduleSessionRecovery()
+            },
+            // A session whose device disappears does NOT reliably raise a runtime error —
+            // it can keep "running" with a dead input. Watch the device list itself:
+            // disappearance falls back per policy, reappearance restores the user's choice.
+            center.addObserver(forName: AVCaptureDevice.wasDisconnectedNotification, object: nil, queue: nil) { [weak self] _ in
+                self?.scheduleSessionRecovery()
+            },
+            center.addObserver(forName: AVCaptureDevice.wasConnectedNotification, object: nil, queue: nil) { [weak self] _ in
+                self?.scheduleSessionRecovery()
             }
         ]
+        stateLock.withLock { configObservers = observers }
     }
 
     private func removeObservers() {
-        guard !configObservers.isEmpty else { return }
+        let observers = stateLock.withLock { () -> [NSObjectProtocol] in
+            let current = configObservers
+            configObservers = []
+            return current
+        }
+        guard !observers.isEmpty else { return }
         let center = NotificationCenter.default
-        for observer in configObservers {
+        for observer in observers {
             center.removeObserver(observer)
         }
-        configObservers.removeAll(keepingCapacity: true)
     }
 
     private static func captureDevice(forUID uid: String) -> AVCaptureDevice? {
@@ -172,24 +263,44 @@ final class MicrophoneCapture: NSObject, AudioCapturer, AVCaptureAudioDataOutput
         if let matched = devices.first(where: { $0.uniqueID == uid }) {
             return matched
         }
-        return devices.first(where: { $0.deviceType == .microphone }) ?? AVCaptureDevice.default(for: .audio)
+        // The chosen UID isn't visible to AVFoundation (device raced away, HAL↔AVF skew).
+        // Fall back along the SAME preference order as the picker policy — never to the
+        // raw system default, which can silently be the very AirPods the policy avoids.
+        let ranked = AudioInputDevices.all().sorted { a, b in
+            rank(a) < rank(b)
+        }
+        for candidate in ranked where candidate.uid != uid {
+            if let device = devices.first(where: { $0.uniqueID == candidate.uid }) {
+                return device
+            }
+        }
+        return nil
+    }
+
+    private static func rank(_ device: AudioInputDevice) -> Int {
+        if device.isBuiltIn { return 0 }
+        return device.isBluetooth ? 2 : 1
     }
 
     func captureOutput(_ output: AVCaptureOutput,
                        didOutput sampleBuffer: CMSampleBuffer,
                        from connection: AVCaptureConnection) {
-        guard sessionActive else { return }
+        // One locked snapshot per buffer; the yield/level calls run outside the lock.
+        let (active, continuation, level) = stateLock.withLock {
+            (_sessionActive, _chunkContinuation, _onLevel)
+        }
+        guard active else { return }
         guard let buffer = Self.makePCMBuffer(from: sampleBuffer) else { return }
 
-        if chunkContinuation != nil {
+        if let continuation {
             guard let samples = resampleToMonoFloat(buffer) else { return }
-            chunkContinuation?.yield(PCM16.fromFloat(samples))
-            self.onLevel?(Self.rmsLevel(samples))
-        } else if let onLevel = self.onLevel {
-            if let level = Self.rmsLevel(buffer) {
-                onLevel(level)
+            continuation.yield(PCM16.fromFloat(samples))
+            level?(Self.rmsLevel(samples))
+        } else if let level {
+            if let rms = Self.rmsLevel(buffer) {
+                level(rms)
             } else if let samples = resampleToMonoFloat(buffer) {
-                onLevel(Self.rmsLevel(samples))
+                level(Self.rmsLevel(samples))
             }
         }
     }
@@ -197,10 +308,19 @@ final class MicrophoneCapture: NSObject, AudioCapturer, AVCaptureAudioDataOutput
     func stop() async {
         sessionActive = false
         removeObservers()
-        chunkContinuation?.finish()
+        // Stop the session and detach the delegate FIRST — only then release the
+        // continuation. (Releasing it while the delegate was still yielding into it
+        // from outputQueue was an unsynchronized ARC handoff: intermittent crashes.)
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            sessionQueue.async { [self] in
+                session.stopRunning()
+                teardownSessionConfiguration()
+                continuation.resume()
+            }
+        }
+        let cont = chunkContinuation
         chunkContinuation = nil
-        session.stopRunning()
-        teardownSessionConfiguration()
+        cont?.finish()
     }
 
     func waitForPendingAudioFlush(timeoutNanos: UInt64) async {
@@ -232,6 +352,7 @@ final class MicrophoneCapture: NSObject, AudioCapturer, AVCaptureAudioDataOutput
         deliveryTask = nil
     }
 
+    /// outputQueue-only (delegate callback path).
     private func resampleToMonoFloat(_ buffer: AVAudioPCMBuffer) -> [Float]? {
         guard let targetFormat else { return nil }
         // Rebuild the converter whenever the live input format changes so it always
