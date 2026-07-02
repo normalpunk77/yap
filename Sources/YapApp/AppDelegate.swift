@@ -28,7 +28,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private var cachedVertexAuth: (account: ServiceAccount, auth: GoogleServiceAccountAuth)?
     private lazy var deliveryQueue = DeliveryQueue(
         makeProcessor: { [weak self] in self?.makePostProcessor() },
-        paste: { text in Paster.pasteAtCursor(text) }
+        // Await the paste's settle window so the queue can't write the next transcript
+        // to the pasteboard while the previous ⌘V is still being consumed.
+        paste: { text in
+            if let settle = Paster.pasteAtCursor(text) { await settle.value }
+        }
     )
 
     func applicationDidFinishLaunching(_ notification: Notification) {

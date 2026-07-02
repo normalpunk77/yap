@@ -63,8 +63,10 @@ final class PasterTests: XCTestCase {
         Paster.pasteAtCursor(
             "new transcript",
             pasteboard: pasteboard,
+            restoreDelayNanos: 50_000_000,
             trustChecker: { true },
-            fallback: { _ in }
+            fallback: { _ in },
+            synthesizePaste: {}
         )
 
         XCTAssertTrue(Paster.hasPendingClipboardRestore)
@@ -80,19 +82,44 @@ final class PasterTests: XCTestCase {
         Paster.pasteAtCursor(
             "first transcript",
             pasteboard: pasteboard,
+            restoreDelayNanos: 100_000_000,
             trustChecker: { true },
-            fallback: { _ in }
+            fallback: { _ in },
+            synthesizePaste: {}
         )
         try? await Task.sleep(nanoseconds: 50_000_000)
         Paster.pasteAtCursor(
             "second transcript",
             pasteboard: pasteboard,
+            restoreDelayNanos: 100_000_000,
             trustChecker: { true },
-            fallback: { _ in }
+            fallback: { _ in },
+            synthesizePaste: {}
         )
 
         await Paster.waitForPendingClipboardRestore()
         XCTAssertEqual(pasteboard.string(forType: .string), "original clipboard")
+    }
+
+    func testSettleTaskCompletesAndKeepsTranscriptWhenPreviousClipboardWasEmpty() async {
+        // With nothing to restore, the settle task must still exist (sequenced callers
+        // await it to space out successive pastes) and the transcript stays on the
+        // clipboard rather than being wiped back to empty.
+        let pasteboard = NSPasteboard.withUniqueName()
+        pasteboard.clearContents()
+
+        let settle = Paster.pasteAtCursor(
+            "solo transcript",
+            pasteboard: pasteboard,
+            restoreDelayNanos: 20_000_000,
+            trustChecker: { true },
+            fallback: { _ in },
+            synthesizePaste: {}
+        )
+
+        XCTAssertNotNil(settle)
+        await settle?.value
+        XCTAssertEqual(pasteboard.string(forType: .string), "solo transcript")
     }
 }
 
@@ -376,6 +403,27 @@ final class DeliveryQueueTests: XCTestCase {
             events.firstIndex(of: "finish first") ?? events.endIndex,
             "second delivery should start before the first one finishes"
         )
+    }
+
+    func testDrainAwaitsEachPasteBeforeDeliveringTheNext() async throws {
+        // Regression: the drain loop burst-pasted ready transcripts synchronously —
+        // the second clipboard write landed before the target app consumed the first
+        // ⌘V, so the earlier dictation was never pasted (later text pasted twice).
+        var events: [String] = []
+        let queue = DeliveryQueue(
+            makeProcessor: { nil },
+            paste: { text in
+                events.append("start \(text)")
+                try? await Task.sleep(nanoseconds: 80_000_000)
+                events.append("end \(text)")
+            }
+        )
+
+        queue.enqueue("one")
+        queue.enqueue("two")
+
+        try await waitFor { events.count == 4 }
+        XCTAssertEqual(events, ["start one", "end one", "start two", "end two"])
     }
 
     func testCancelAndDrainKeepsRawTranscriptOnShutdown() async throws {

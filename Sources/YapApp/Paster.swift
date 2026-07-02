@@ -14,13 +14,22 @@ enum Paster {
     /// When Accessibility is not trusted, the clipboard is left untouched and a manual fallback
     /// explains how to copy the transcript instead of silently destroying the user's prior data.
     /// When trusted, the user's previous clipboard is restored after the paste.
+    ///
+    /// Returns the "settle" task: it completes once the paste window has elapsed (and any
+    /// clipboard restore ran). Sequenced callers (DeliveryQueue) MUST await it before writing
+    /// the next transcript to the pasteboard — the target app consumes the ⌘V asynchronously,
+    /// so an immediate second write makes it read the WRONG text. Returns nil when nothing was
+    /// pasted (Accessibility fallback path).
+    @discardableResult
     @MainActor
     static func pasteAtCursor(
         _ text: String,
         pasteboard: NSPasteboard = .general,
+        restoreDelayNanos: UInt64 = 800_000_000,
         trustChecker: @MainActor () -> Bool = promptForAccessibility,
-        fallback: @MainActor (String) -> Void = presentAccessibilityDeniedFallback
-    ) {
+        fallback: @MainActor (String) -> Void = presentAccessibilityDeniedFallback,
+        synthesizePaste: @MainActor () -> Void = synthesizeCommandV
+    ) -> Task<Void, Never>? {
         let pb = pasteboard
         // Snapshot the entire clipboard payload so we can put it back after the paste.
         let previous = ClipboardSnapshot(pasteboard: pb)
@@ -29,18 +38,19 @@ enum Paster {
         // user already had copied.
         guard trustChecker() else {
             fallback(text)
-            return
+            return nil
         }
         let changeCountBeforeWrite = pb.changeCount
         pb.clearContents()
         pb.setString(text, forType: .string)
         let writeCount = pb.changeCount
-        synthesizeCommandV()
+        synthesizePaste()
         // Restore the user's previous clipboard once the paste has consumed ours, so dictating
-        // doesn't silently wipe what they had copied. The short delay lets the synthesized ⌘V
-        // read our string first.
-        guard let previous else { return }
-        let snapshotToRestore: ClipboardSnapshot
+        // doesn't silently wipe what they had copied. There is NO consumption signal for a
+        // synthesized ⌘V — the target app reads the pasteboard on its own time — so the delay
+        // must be generous: 300 ms could restore BEFORE a slow app (Electron under load) read
+        // our string, pasting stale content and losing the transcript.
+        let snapshotToRestore: ClipboardSnapshot?
         if let existingSnapshot = pendingClipboardRestoreSnapshot,
            let existingWriteCount = pendingClipboardRestoreWriteCount,
            changeCountBeforeWrite == existingWriteCount {
@@ -52,7 +62,7 @@ enum Paster {
         pendingClipboardRestoreSnapshot = snapshotToRestore
         pendingClipboardRestoreWriteCount = writeCount
         let task = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 300_000_000)
+            try? await Task.sleep(nanoseconds: restoreDelayNanos)
             defer {
                 pendingClipboardRestoreTasks[token] = nil
                 if pendingClipboardRestoreTasks.isEmpty {
@@ -62,12 +72,15 @@ enum Paster {
             }
             // Only restore if OUR transcript is still on the clipboard. If a second dictation or
             // another app wrote in the meantime (changeCount moved), leave theirs untouched
-            // instead of clobbering it with a stale value.
+            // instead of clobbering it with a stale value. With no previous snapshot (empty
+            // clipboard before the paste) the transcript intentionally stays on the clipboard.
             guard pb.changeCount == writeCount else { return }
+            guard let snapshotToRestore else { return }
             pb.clearContents()
             _ = pb.writeObjects(snapshotToRestore.restoredItems())
         }
         pendingClipboardRestoreTasks[token] = task
+        return task
     }
 
     /// True when the process may post synthetic key events. When not yet trusted,
