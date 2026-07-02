@@ -14,6 +14,10 @@ final class GeminiWireModelTests: XCTestCase {
         XCTAssertEqual(userParts.first?["text"] as? String, "hello world")
         let gen = obj["generationConfig"] as! [String: Any]
         XCTAssertEqual(gen["temperature"] as? Double, 0)
+        // Thinking must be disabled: 2.5 Flash's default DYNAMIC thinking added seconds
+        // of latency to a mechanical rewrite and pushed cleanups past their timeout.
+        let thinking = gen["thinkingConfig"] as! [String: Any]
+        XCTAssertEqual(thinking["thinkingBudget"] as? Int, 0)
     }
 
     func testParseTextExtractsCandidate() throws {

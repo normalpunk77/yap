@@ -21,24 +21,33 @@ public struct GeminiPostProcessor: TextPostProcessor {
     private let prompt: String
     private let auth: Auth
     private let session: URLSession
+    private let onAuthFailure: (@Sendable () async -> Void)?
 
     /// One shared session for all cleanups. A processor is built PER DICTATION
     /// (settings apply without restart), and a URLSession is never reclaimed just by
     /// deallocation — a fresh ephemeral session per dictation accumulated forever.
     private static let sharedSession = URLSession(configuration: .ephemeral)
 
-    public init(model: GeminiModel, prompt: String, auth: Auth, session: URLSession? = nil) {
+    /// `onAuthFailure` runs when the endpoint answers 401/403 — the owner invalidates
+    /// its cached OAuth token there so the NEXT cleanup mints a fresh one, instead of
+    /// reusing a dead token until its local expiry (up to an hour of broken cleanup).
+    public init(model: GeminiModel, prompt: String, auth: Auth, session: URLSession? = nil,
+                onAuthFailure: (@Sendable () async -> Void)? = nil) {
         self.model = model
         self.prompt = prompt
         self.auth = auth
         self.session = session ?? Self.sharedSession
+        self.onAuthFailure = onAuthFailure
     }
 
     public func process(_ text: String) async throws -> String {
         let request = try await makeRequest(transcript: text)
         let (data, response) = try await session.data(for: request)
         let code = (response as? HTTPURLResponse)?.statusCode ?? -1
-        guard code == 200 else { throw GeminiPostProcessorError.httpStatus(code) }
+        guard code == 200 else {
+            if code == 401 || code == 403 { await onAuthFailure?() }
+            throw GeminiPostProcessorError.httpStatus(code)
+        }
         return try GeminiWire.parseText(data)
     }
 

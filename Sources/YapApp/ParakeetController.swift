@@ -12,9 +12,12 @@ protocol ParakeetManaging: AnyObject {
 protocol ClipboardReading {
     var changeCount: Int { get }
     func string(forType type: NSPasteboard.PasteboardType) -> String?
+    func clear()
 }
 
-extension NSPasteboard: ClipboardReading {}
+extension NSPasteboard: ClipboardReading {
+    func clear() { clearContents() }
+}
 
 /// Drives on-device dictation through the Parakeet daemon — the parallel of the cloud
 /// `DictationController`. The hotkey toggles recording over the daemon's Unix socket; the
@@ -26,6 +29,10 @@ final class ParakeetController {
     private let clipboard: ClipboardReading
     private var recording = false
     private var starting = false
+    private var recordingStartedAt: Date?
+    /// Poll cadence for the daemon's clipboard hand-off; injectable so tests don't
+    /// wait out real seconds.
+    var pollIntervalNanos: UInt64 = 50_000_000
     /// The in-flight clipboard-polling task from the current `stop()`. Held so a new `start()`
     /// can cancel it — otherwise a stale poller from a previous (e.g. silent) session could fire
     /// `onText` into the NEXT dictation, pasting the wrong transcript.
@@ -89,6 +96,7 @@ final class ParakeetController {
         // Show the aura immediately on the keypress — the first start blocks for seconds while
         // the daemon loads the model, and a silent app reads as broken. Revert if it fails.
         recording = true
+        recordingStartedAt = Date()
         onRecording?(true)
         do {
             try await manager.ensureDaemonRunning()
@@ -106,9 +114,18 @@ final class ParakeetController {
         }
     }
 
+    /// How long to wait for the daemon's transcript, scaled to what was recorded: on-device
+    /// transcription time grows with the audio length, and the old fixed 6 s cap silently
+    /// dropped every dictation long enough to transcribe slower than that.
+    static func pollBudgetSeconds(forRecordingSeconds duration: Double) -> Double {
+        min(60, max(10, duration * 0.5))
+    }
+
     private func stop() async {
         defer { onSessionEnded?() }
         recording = false
+        let recordedSeconds = recordingStartedAt.map { Date().timeIntervalSince($0) } ?? 0
+        recordingStartedAt = nil
         // Recording has ended — drop the aura (and the level meter) immediately, regardless of
         // whether any speech was captured. Otherwise a press-without-speaking left the aura lit
         // for the whole no-speech timeout below.
@@ -119,12 +136,16 @@ final class ParakeetController {
             onError?("The local engine failed to stop recording.")
             return
         }
-        // The daemon transcribes (~0.5 s) then copies the text to the clipboard. Poll for it in a
-        // cancellable task so a fresh start() can abandon this wait. Give up after ~6 s (silence).
+        // The daemon transcribes then copies the text to the clipboard. Poll for it in a
+        // cancellable task so a fresh start() can abandon this wait.
+        let budgetNanos = UInt64(Self.pollBudgetSeconds(forRecordingSeconds: recordedSeconds) * 1_000_000_000)
+        let polls = max(1, Int(budgetNanos / max(1, pollIntervalNanos)))
+        let interval = pollIntervalNanos
         let task = Task { [weak self] in
-            for _ in 0 ..< 120 {
+            for _ in 0 ..< polls {
                 if Task.isCancelled { return }
                 if let self, self.clipboard.changeCount != countBefore {
+                    let observed = self.clipboard.changeCount
                     let text = self.clipboard.string(forType: .string) ?? ""
                     // A change-count bump after we sent "stop" is the daemon's transcript copy.
                     // Deliver the first non-empty result. Do NOT also require it to differ from the
@@ -134,13 +155,22 @@ final class ParakeetController {
                         if Task.isCancelled { return }   // a fresh start() may have cancelled us
                         // The daemon left the RAW transcript on the clipboard. Clear it before
                         // delivery so the paste path's restore doesn't put that raw text back —
-                        // otherwise a later ⌘V would yield the un-cleaned transcript.
-                        NSPasteboard.general.clearContents()
+                        // otherwise a later ⌘V would yield the un-cleaned transcript. Only if the
+                        // count hasn't moved AGAIN: a newer write is the user's own copy, and
+                        // clearing it would destroy their clipboard.
+                        if self.clipboard.changeCount == observed {
+                            self.clipboard.clear()
+                        }
                         self.onText?(text)
                         return
                     }
                 }
-                try? await Task.sleep(nanoseconds: 50_000_000)   // 50 ms × 120 ≈ 6 s
+                try? await Task.sleep(nanoseconds: interval)
+            }
+            // Ran out of budget with no transcript: say so — the silent give-up looked
+            // like the app ate the dictation.
+            if !Task.isCancelled {
+                self?.onError?("The local engine didn't return a transcript in time. Check the daemon log in ~/Library/Application Support/Yap if this keeps happening.")
             }
         }
         pollTask = task

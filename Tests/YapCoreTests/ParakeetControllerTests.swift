@@ -7,7 +7,9 @@ final class ParakeetControllerTests: XCTestCase {
     final class FakeClipboard: ClipboardReading {
         var changeCount = 0
         var value = ""
+        var clearCalls = 0
         func string(forType type: NSPasteboard.PasteboardType) -> String? { value }
+        func clear() { clearCalls += 1; value = "" }
     }
 
     final class FakeManager: ParakeetManaging {
@@ -58,6 +60,54 @@ final class ParakeetControllerTests: XCTestCase {
         }
 
         func stopDaemon() {}
+    }
+
+    func testPollBudgetScalesWithRecordingDuration() {
+        // Short dictations keep a snappy floor; long ones get transcription time
+        // proportional to the audio (the fixed 6 s cap silently dropped anything
+        // that transcribed slower); a hard ceiling bounds clipboard exposure.
+        XCTAssertEqual(ParakeetController.pollBudgetSeconds(forRecordingSeconds: 0), 10)
+        XCTAssertEqual(ParakeetController.pollBudgetSeconds(forRecordingSeconds: 12), 10)
+        XCTAssertEqual(ParakeetController.pollBudgetSeconds(forRecordingSeconds: 60), 30)
+        XCTAssertEqual(ParakeetController.pollBudgetSeconds(forRecordingSeconds: 600), 60)
+    }
+
+    func testPollTimeoutSurfacesAnErrorInsteadOfSilence() async throws {
+        let manager = FakeManager()
+        let clipboard = FakeClipboard()   // never changes → the daemon never delivers
+        let controller = ParakeetController(manager: manager, clipboard: clipboard)
+        controller.pollIntervalNanos = 1_000_000   // 1 ms — don't wait out real seconds
+
+        var errors: [String] = []
+        controller.onError = { errors.append($0) }
+        controller.onRecording = { _ in }
+
+        await controller.toggle()   // start
+        await controller.toggle()   // stop → poll runs out with no transcript
+
+        XCTAssertEqual(errors.count, 1)
+        XCTAssertTrue(errors[0].contains("didn't return a transcript"), "got: \(errors)")
+    }
+
+    func testDeliveredTranscriptClearsClipboardOnlyWhenStillOurs() async throws {
+        let manager = FakeManager()
+        let clipboard = FakeClipboard()
+        let controller = ParakeetController(manager: manager, clipboard: clipboard)
+        controller.pollIntervalNanos = 1_000_000
+        manager.onStop = {
+            clipboard.changeCount += 1
+            clipboard.value = "transcript"
+        }
+
+        var texts: [String] = []
+        controller.onText = { texts.append($0) }
+        controller.onRecording = { _ in }
+
+        await controller.toggle()   // start
+        await controller.toggle()   // stop → daemon "copies" the transcript
+
+        XCTAssertEqual(texts, ["transcript"])
+        XCTAssertEqual(clipboard.clearCalls, 1)   // ours → cleared
     }
 
     func testFailedStartCommandRollsRecordingBack() async throws {

@@ -59,6 +59,15 @@ public actor GoogleServiceAccountAuth {
         return try await task.value
     }
 
+    /// Drop the cached token so the next call mints a fresh one. Called when the API
+    /// answers 401/403 to a token we still believed valid (revoked, clock drift):
+    /// without this, every cleanup kept reusing the dead token until its local expiry —
+    /// up to an hour of silently broken post-processing.
+    public func invalidateCachedToken() {
+        cachedToken = nil
+        expiry = .distantPast
+    }
+
     private func mintToken() async throws -> String {
         let jwt = try makeJWT()
         var req = URLRequest(url: URL(string: "https://oauth2.googleapis.com/token")!)
@@ -80,7 +89,9 @@ public actor GoogleServiceAccountAuth {
     }
 
     func makeJWT() throws -> String {
-        let iat = Int(now().timeIntervalSince1970)
+        // Backdate iat by 60 s: Google rejects assertions whose iat sits in the future
+        // of THEIR clock, so a Mac running fast fails every mint with invalid_grant.
+        let iat = Int(now().timeIntervalSince1970) - 60
         let exp = iat + 3600
         let header = ["alg": "RS256", "typ": "JWT"]
         let claims: [String: Any] = [

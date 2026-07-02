@@ -12,7 +12,11 @@ public enum GeminiWire {
         let payload: [String: Any] = [
             "systemInstruction": ["parts": [["text": prompt]]],
             "contents": [["role": "user", "parts": [["text": transcript]]]],
-            "generationConfig": ["temperature": 0],
+            // thinkingBudget 0 disables 2.5 Flash's DYNAMIC thinking (Flash Lite already
+            // defaults off). Cleanup is a mechanical rewrite: thinking adds seconds of
+            // latency for nothing and pushed slow responses past the cleanup timeout —
+            // which pastes the RAW transcript and silently wastes the whole call.
+            "generationConfig": ["temperature": 0, "thinkingConfig": ["thinkingBudget": 0]],
         ]
         return try JSONSerialization.data(withJSONObject: payload)
     }

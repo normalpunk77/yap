@@ -81,6 +81,13 @@ final class ParakeetManager: ObservableObject, ParakeetManaging {
         await task.value
     }
 
+    /// Cancel an in-flight setup, terminating its child processes (cargo build / model
+    /// downloader). Called on app quit — without it those children survive as orphans,
+    /// burning CPU and writing files long after Yap is gone.
+    func cancelSetup() {
+        setupTask?.cancel()
+    }
+
     private func runSetup() async {
         do {
             try await buildBinaryIfNeeded()
@@ -128,15 +135,18 @@ final class ParakeetManager: ObservableObject, ParakeetManaging {
         env["LANG"] = "en_US.UTF-8"
         env["LC_CTYPE"] = "en_US.UTF-8"
         process.environment = env
-        // Send the daemon's output to a log file (not /dev/null) so a failed start is
-        // diagnosable. Fall back to discarding if the file can't be created.
+        // Send the daemon's DIAGNOSTICS (stderr) to a log file so a failed start is
+        // diagnosable. stdout is discarded on purpose: the daemon prints every finished
+        // TRANSCRIPT there, and logging it persisted the user's dictated text in
+        // plaintext on disk. The log is created user-only (0600) — Application Support
+        // files default to world-readable.
         try? fm.createDirectory(at: support, withIntermediateDirectories: true)
-        fm.createFile(atPath: daemonLogURL.path, contents: nil)
+        fm.createFile(atPath: daemonLogURL.path, contents: nil,
+                      attributes: [.posixPermissions: 0o600])
+        process.standardOutput = FileHandle.nullDevice
         if let logHandle = try? FileHandle(forWritingTo: daemonLogURL) {
-            process.standardOutput = logHandle
             process.standardError = logHandle
         } else {
-            process.standardOutput = FileHandle.nullDevice
             process.standardError = FileHandle.nullDevice
         }
         try process.run()
@@ -165,15 +175,14 @@ final class ParakeetManager: ObservableObject, ParakeetManaging {
         return true
     }
 
-    /// The input device name to pin the daemon to, matching the user's mic choice (built-in by
-    /// default). Returns nil only when neither the chosen device nor a built-in mic resolves, in
-    /// which case the daemon falls back to the system default.
+    /// The input device name to pin the daemon to, resolved through the SAME policy as
+    /// `MicrophoneCapture` (honor a non-Bluetooth selection; avoid Bluetooth inputs while
+    /// output is Bluetooth; built-in → non-Bluetooth fallback). The old built-in-only
+    /// fallback returned nil on Macs without a built-in mic, letting the daemon grab the
+    /// system DEFAULT input — the very AirPods the policy exists to avoid.
     private func preferredInputDeviceName() -> String? {
-        if let uid = AppConfig.preferredInputDeviceUID,
-           let chosen = AudioInputDevices.all().first(where: { $0.uid == uid }) {
-            return chosen.name
-        }
-        return AudioInputDevices.builtIn()?.name
+        guard let uid = AudioInputDevices.preferredDictationInputUID() else { return nil }
+        return AudioInputDevices.all().first(where: { $0.uid == uid })?.name
     }
 
     /// Terminate a daemon left running by a previous session and remove its pid file (both the
@@ -345,18 +354,24 @@ final class ParakeetManager: ObservableObject, ParakeetManaging {
         fm.createFile(atPath: errLog.path, contents: nil)
         let errHandle = try? FileHandle(forWritingTo: errLog)
         process.standardError = errHandle ?? FileHandle.nullDevice
-        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-            process.terminationHandler = { [errLog] proc in
-                try? errHandle?.close()
-                if proc.terminationStatus == 0 {
-                    cont.resume()
-                } else {
-                    let tail = String((try? String(contentsOf: errLog, encoding: .utf8))?.suffix(2000) ?? "")
-                    Diag.conn.error("\((launchPath as NSString).lastPathComponent) failed (\(proc.terminationStatus)): \(tail, privacy: .public)")
-                    cont.resume(throwing: ParakeetError.commandFailed(launchPath, Int(proc.terminationStatus)))
+        // Terminate the child if the enclosing task is cancelled (app quit, setup
+        // abandoned) — a clone/build otherwise keeps running as an orphan.
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+                process.terminationHandler = { [errLog] proc in
+                    try? errHandle?.close()
+                    if proc.terminationStatus == 0 {
+                        cont.resume()
+                    } else {
+                        let tail = String((try? String(contentsOf: errLog, encoding: .utf8))?.suffix(2000) ?? "")
+                        Diag.conn.error("\((launchPath as NSString).lastPathComponent) failed (\(proc.terminationStatus)): \(tail, privacy: .public)")
+                        cont.resume(throwing: ParakeetError.commandFailed(launchPath, Int(proc.terminationStatus)))
+                    }
                 }
+                do { try process.run() } catch { try? errHandle?.close(); cont.resume(throwing: error) }
             }
-            do { try process.run() } catch { try? errHandle?.close(); cont.resume(throwing: error) }
+        } onCancel: {
+            process.terminate()
         }
     }
 

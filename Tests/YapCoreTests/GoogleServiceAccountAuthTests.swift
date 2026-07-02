@@ -48,6 +48,47 @@ final class GoogleServiceAccountAuthTests: XCTestCase {
         XCTAssertEqual(recovered, pkcs1)
     }
 
+    func testJWTBackdatesIssuedAtAgainstClockSkew() async throws {
+        // Google rejects assertions whose iat is in the future of THEIR clock; a Mac
+        // running fast failed every mint with invalid_grant. iat must be backdated.
+        let (pem, _) = try makeTestKey()
+        let sa = ServiceAccount(json: """
+        {"client_email":"a@b.iam.gserviceaccount.com","private_key":\(pemJSONEscaped(pem)),"project_id":"p"}
+        """)!
+        let fixedNow = Date(timeIntervalSince1970: 1_000_000)
+        let auth = GoogleServiceAccountAuth(account: sa, now: { fixedNow })
+        let jwt = try await auth.makeJWT()
+        let claimsPart = jwt.split(separator: ".")[1]
+        let claims = try JSONSerialization.jsonObject(
+            with: Data(base64urlEncoded: String(claimsPart))!) as! [String: Any]
+        XCTAssertEqual(claims["iat"] as? Int, 1_000_000 - 60)
+        XCTAssertEqual(claims["exp"] as? Int, 1_000_000 - 60 + 3600)
+    }
+
+    func testInvalidateCachedTokenForcesFreshMint() async throws {
+        let (pem, _) = try makeTestKey()
+        let sa = ServiceAccount(json: """
+        {"client_email":"a@b.iam.gserviceaccount.com","private_key":\(pemJSONEscaped(pem)),"project_id":"p"}
+        """)!
+        nonisolated(unsafe) var calls = 0
+        MockURLProtocol.handler = { _ in
+            calls += 1
+            let body = #"{"access_token":"tok-\#(calls)","expires_in":3600}"#
+            return (200, Data(body.utf8))
+        }
+        let auth = GoogleServiceAccountAuth(account: sa, session: MockURLProtocol.session())
+
+        let first = try await auth.accessToken()
+        let cached = try await auth.accessToken()
+        XCTAssertEqual(first, cached)          // second call served from cache
+        XCTAssertEqual(calls, 1)
+
+        await auth.invalidateCachedToken()     // e.g. the API answered 401 to `first`
+        let reminted = try await auth.accessToken()
+        XCTAssertEqual(calls, 2)               // a real re-mint happened
+        XCTAssertNotEqual(reminted, first)
+    }
+
     func testRS256SignatureVerifies() throws {
         let (pem, publicKey) = try makeTestKey()
         let signingInput = "header.payload"

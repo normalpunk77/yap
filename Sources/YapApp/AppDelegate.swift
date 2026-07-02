@@ -257,7 +257,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             return GeminiPostProcessor(
                 model: s.model, prompt: s.prompt,
                 auth: .vertex(token: { try await auth.accessToken() },
-                              project: s.vertexProject, region: region)
+                              project: s.vertexProject, region: region),
+                // A 401/403 means the cached token died early (revoked, clock drift):
+                // drop it so the next cleanup mints fresh instead of failing for the
+                // rest of the token's local lifetime.
+                onAuthFailure: { await auth.invalidateCachedToken() }
             )
         }
     }
@@ -716,6 +720,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     /// NSApplication.terminate directly, bypassing `quit()`), and system logout. Shut the
     /// Parakeet daemon down so it can't outlive the app holding the microphone and socket.
     func applicationWillTerminate(_ notification: Notification) {
+        // Kill an in-flight setup's children (cargo build / model downloader) so they
+        // don't survive Yap as orphan processes.
+        ParakeetManager.shared.cancelSetup()
         parakeetController.shutdown()
     }
 
