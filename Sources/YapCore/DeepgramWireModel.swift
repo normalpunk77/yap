@@ -13,12 +13,14 @@ enum DeepgramResponse: Equatable {
     private struct Frame: Decodable {
         let type: String?
         let isFinal: Bool?
+        let fromFinalize: Bool?
         let channel: Channel?
         struct Channel: Decodable { let alternatives: [Alternative]? }
         struct Alternative: Decodable { let transcript: String? }
         enum CodingKeys: String, CodingKey {
             case type
             case isFinal = "is_final"
+            case fromFinalize = "from_finalize"
             case channel
         }
     }
@@ -27,7 +29,13 @@ enum DeepgramResponse: Equatable {
         let frame = try decoder.decode(Frame.self, from: data)
         guard frame.type == "Results" else { return .ignored }
         let transcript = frame.channel?.alternatives?.first?.transcript ?? ""
-        guard !transcript.isEmpty else { return .ignored }
+        guard !transcript.isEmpty else {
+            // Deepgram acks our `Finalize` with `from_finalize:true`; when there was no
+            // un-flushed tail its transcript is EMPTY. That ack must still surface as a
+            // committed segment — it is what lets a stop-after-pause finish immediately
+            // instead of waiting out the finalize safety timeout.
+            return frame.fromFinalize == true ? .committed("") : .ignored
+        }
         return (frame.isFinal == true) ? .committed(transcript) : .partial(transcript)
     }
 }

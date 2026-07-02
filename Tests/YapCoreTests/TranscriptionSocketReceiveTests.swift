@@ -22,4 +22,14 @@ final class TranscriptionSocketReceiveTests: XCTestCase {
         XCTAssertEqual(URLSessionTranscriptionSocket.classify(receiveFailure: DummyError(), responseStatus: 404),
                        .unknown("HTTP 404"))
     }
+
+    func testNoHTTPResponseFailureIsRecoverableSocketClose() {
+        // No HTTP response at all = the connection never established (Wi-Fi blip, DNS,
+        // captive portal). Surfacing it as a fatal `.unknown` made the controller discard
+        // the whole dictation on the FIRST reconnect attempt after a mid-session outage —
+        // it must be recoverable so the bounded reconnect/backoff loop applies.
+        let mapped = URLSessionTranscriptionSocket.classify(receiveFailure: DummyError(), responseStatus: nil)
+        XCTAssertEqual(mapped, .socketClosed,
+                       "a transport failure with no HTTP response must be retryable, not fatal")
+    }
 }

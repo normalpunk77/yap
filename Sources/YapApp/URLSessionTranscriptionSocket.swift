@@ -107,7 +107,7 @@ final class URLSessionTranscriptionSocket: NSObject, TranscriptionSocket, URLSes
             let status = (task.response as? HTTPURLResponse)?.statusCode
             let mapped = Self.classify(receiveFailure: error, responseStatus: status)
             if mapped == .socketClosed {
-                Diag.conn.info("\(self.provider, privacy: .public): receive ended after WebSocket upgrade")
+                Diag.conn.info("\(self.provider, privacy: .public): receive ended (status \(status.map(String.init) ?? "none", privacy: .public)): \(Diag.describe(error), privacy: .public)")
             } else {
                 Diag.conn.error("\(self.provider, privacy: .public): receive failed (status \(status.map(String.init) ?? "—", privacy: .public)) → \(String(describing: mapped), privacy: .public)")
             }
@@ -123,14 +123,17 @@ final class URLSessionTranscriptionSocket: NSObject, TranscriptionSocket, URLSes
     /// retrying it would fail identically. A **101** status (the handshake succeeded) with a
     /// receive failure means the stream dropped *after* a good handshake: a transient
     /// mid-dictation drop the controller recovers from by reconnecting, so report
-    /// `.socketClosed` instead of a misleading "HTTP 101". With no HTTP response at all the
-    /// connection never established — surface the transport error.
+    /// `.socketClosed`. With no HTTP response at all the connection never established — a
+    /// Wi-Fi blip, DNS hiccup, or captive portal. That too must be `.socketClosed`
+    /// (retryable): surfacing it as fatal made a mid-dictation outage discard the whole
+    /// accumulated transcript on the FIRST reconnect attempt, bypassing the bounded
+    /// reconnect/backoff loop entirely.
     static func classify(receiveFailure error: Error, responseStatus: Int?) -> TranscriptionError {
         if let status = responseStatus {
             if status == 101 { return .socketClosed }
             return .unknown("HTTP \(status)")
         }
-        return .unknown((error as NSError).localizedDescription)
+        return .socketClosed
     }
 
     func close() async {

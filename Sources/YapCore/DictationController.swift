@@ -48,6 +48,20 @@ public actor DictationController {
     // state already at `.listening`, so without this a second fast toggle would read
     // `.listening` and finalize a half-started session. Toggles are ignored meanwhile.
     private var starting = false
+    // Monotonic session generation. Bumped by `start()` and `teardown()`. Long-running
+    // async paths (finalize, reconnect, the finalize timeout) capture it at entry and
+    // re-check after every suspension: on a mismatch they are STALE — a newer session
+    // owns the mic/client/state now — and must return without touching anything.
+    private var sessionEpoch = 0
+    // True once THIS session's Finalize/commit control message actually went out. An
+    // unsolicited provider auto-commit landing while `.finalizing` but before the commit
+    // was sent must accumulate, NOT deliver — delivering early skips the flush and drops
+    // the trailing words still in the pipeline.
+    private var commitSent = false
+    // Single-flight latch for `flushPendingChunks`: two loops interleaving on the actor
+    // (reconnect drain vs live capture) corrupted the shared queue/index across their
+    // `await sendChunk` suspensions — duplicate audio and a removeFirst trap.
+    private var flushing = false
 
     private var committedText = ""
     private var partial = ""
@@ -97,6 +111,10 @@ public actor DictationController {
             // bring up a fresh session, instead of swallowing the tap (which felt like a
             // cooldown: the aura was already off but the second round wouldn't start). Hold
             // `starting` across both steps so an interleaved tap can't double-fire `start()`.
+            // If a delivery is ALREADY in flight (`finishing`), let it land: starting a new
+            // session while its teardown is mid-suspension would hand teardown the new
+            // session's client/state to destroy.
+            if finishing { return }
             starting = true
             defer { starting = false }
             await finishAndDeliver()
@@ -125,6 +143,8 @@ public actor DictationController {
     private func start() async {
         starting = true
         defer { starting = false }
+        sessionEpoch += 1
+        commitSent = false
         committedText = ""
         partial = ""
         reconnectAttempts = 0
@@ -165,29 +185,54 @@ public actor DictationController {
     }
 
     private func finalize() async {
+        // Everything below suspends repeatedly, and a tap during that time legitimately
+        // delivers + restarts (the `.finalizing` toggle branch). The epoch pins this call
+        // to ITS session: once it moves on, this finalize is stale and must not touch the
+        // successor's capture, client, or timers — the old behavior stopped the NEW
+        // session's mic and sent a Finalize on its client, so the next dictation recorded
+        // nothing.
+        let epoch = sessionEpoch
         setState(.finalizing)
         // Keep the mic open briefly so a word spoken right up to the keypress is still captured
         // (its audio isn't recorded yet at the instant of the press). Chunks keep flowing to the
         // live client during this window via `forwardChunk`.
         if trailingCaptureNanos > 0 { try? await Task.sleep(nanoseconds: trailingCaptureNanos) }
+        guard epoch == sessionEpoch else { return }
         await stopCapture()
+        guard epoch == sessionEpoch else { return }
         // Wait for the capture pipeline to hand off the last buffered audio before we
         // send the commit. This removes the fixed post-stop sleep when the buffer drains
         // quickly, but still bounds the wait by the configured flush budget.
         await capturer.waitForPendingAudioFlush(timeoutNanos: flushDelayNanos)
-        do {
-            try await client?.sendCommit()
-        } catch {
-            // Don't discard a whole dictation if the final commit packet fails (e.g. the
-            // socket just dropped): deliver whatever we've already accumulated.
-            await finishAndDeliver()
-            return
+        guard epoch == sessionEpoch else { return }
+        if let client {
+            // Drain any backlog buffered during a reconnect gap first, so the commit
+            // flushes ALL the audio — not just what happened to be sent already.
+            await flushPendingChunks(using: client)
+            guard epoch == sessionEpoch else { return }
         }
+        if let client {
+            do {
+                try await client.sendCommit()
+                guard epoch == sessionEpoch else { return }
+                commitSent = true
+            } catch {
+                guard epoch == sessionEpoch else { return }
+                // Don't discard a whole dictation if the final commit packet fails (e.g. the
+                // socket just dropped): deliver whatever we've already accumulated.
+                await finishAndDeliver()
+                return
+            }
+        }
+        // `client == nil` means a reconnect is mid-backoff: it checks `.finalizing` when
+        // it lands and sends the deferred commit itself. The timeout below still bounds
+        // the whole wait either way.
+        guard epoch == sessionEpoch, case .finalizing = state else { return }
         // Safety net: if the final committed segment never arrives, finish with
         // whatever we have rather than hanging in `finalizing`.
         finalizeTimeoutTask = Task { [weak self, finalizeTimeoutNanos] in
             try? await Task.sleep(nanoseconds: finalizeTimeoutNanos)
-            await self?.forceFinish()
+            await self?.forceFinish(ifEpoch: epoch)
         }
     }
 
@@ -214,7 +259,11 @@ public actor DictationController {
             appendCommitted(text)
             partial = ""
             if case .finalizing = state {
-                await finishAndDeliver()
+                // Deliver only once OUR commit went out: an unsolicited auto-commit landing
+                // in the pre-commit window (stop right after a natural pause) must
+                // accumulate — delivering early skips the Finalize flush and drops the
+                // trailing words still in the pipeline.
+                if commitSent { await finishAndDeliver() }
             } else if case .listening = state {
                 setState(.listening(displayText))
             }
@@ -237,8 +286,7 @@ public actor DictationController {
                 // not a failure. Ignore it instead of flipping a finished dictation to `.error`.
             } else {
                 Diag.conn.error("fatal stream error → stopping: \(String(describing: error), privacy: .public)")
-                await teardown()
-                setState(.error("\(error)"))
+                await failSession("\(error)")
             }
         }
     }
@@ -249,11 +297,11 @@ public actor DictationController {
         guard !reconnecting else { return }
         reconnecting = true
         defer { reconnecting = false }
+        let epoch = sessionEpoch
         reconnectAttempts += 1
         guard reconnectAttempts <= maxReconnects else {
             Diag.conn.error("reconnect gave up after \(self.maxReconnects) attempts — surfacing 'Connection closed'")
-            await teardown()
-            setState(.error("socketClosed"))
+            await failSession("socketClosed")
             return
         }
         Diag.conn.error("stream dropped mid-dictation — reconnecting (attempt \(self.reconnectAttempts)/\(self.maxReconnects))")
@@ -263,11 +311,15 @@ public actor DictationController {
         eventTask = nil
         await client?.close()
         client = nil
-        try? await Task.sleep(nanoseconds: UInt64(reconnectAttempts) * reconnectBackoffNanos)
+        await backoffSleep(UInt64(reconnectAttempts) * reconnectBackoffNanos)
         // The user may have stopped (or it was torn down) during the backoff.
-        guard capturing else { return }
+        guard epoch == sessionEpoch else { return }
         switch state {
-        case .listening, .finalizing:
+        case .listening:
+            guard capturing else { return }
+        case .finalizing:
+            // The mic already stopped, but the user's stop found `client == nil` and
+            // deferred its commit to us — the tail still needs this connection.
             break
         default:
             return
@@ -281,9 +333,34 @@ public actor DictationController {
             if !tail.isEmpty { client.primePreviousText(tail) }
             startEventLoop(for: client)
             await flushPendingChunks(using: client)
+            guard epoch == sessionEpoch else { return }
+            if case .finalizing = state, !commitSent {
+                do {
+                    try await client.sendCommit()
+                    guard epoch == sessionEpoch else { return }
+                    commitSent = true
+                } catch {
+                    guard epoch == sessionEpoch else { return }
+                    await finishAndDeliver()
+                }
+            }
         } catch {
-            await teardown()
-            setState(.error("\(error)"))
+            guard epoch == sessionEpoch else { return }
+            await failSession("\(error)")
+        }
+    }
+
+    /// Sleep that survives running inside a just-cancelled task. `reconnect()` usually
+    /// executes within the event-loop task it has itself cancelled, where a plain
+    /// `Task.sleep` returns immediately — which silently turned the reconnect backoff
+    /// into a storm of instant retries.
+    private func backoffSleep(_ nanos: UInt64) async {
+        guard nanos > 0 else { return }
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            Task.detached {
+                try? await Task.sleep(nanoseconds: nanos)
+                continuation.resume()
+            }
         }
     }
 
@@ -298,8 +375,11 @@ public actor DictationController {
         return tail
     }
 
-    private func forceFinish() async {
-        if case .finalizing = state { await finishAndDeliver() }
+    private func forceFinish(ifEpoch epoch: Int) async {
+        // The safety timer belongs to ONE session; a stale one (its session already
+        // delivered while finalize was suspended) must not clip the next dictation.
+        guard epoch == sessionEpoch, case .finalizing = state else { return }
+        await finishAndDeliver()
     }
 
     private func finishAndDeliver() async {
@@ -316,37 +396,74 @@ public actor DictationController {
         // before the timeout — the "it doesn't always paste the tail" bug.
         let result = displayText.trimmingCharacters(in: .whitespacesAndNewlines)
         await teardown()
+        let epoch = sessionEpoch
         if !result.isEmpty {
             let handler = onResult
             await MainActor.run { handler?(result) }
+            // A new session may have started while we delivered on the main actor —
+            // its `.listening` must not be clobbered back to `.idle`.
+            guard epoch == sessionEpoch else { return }
         }
         setState(.idle)
     }
 
+    /// Tear the session down surfacing `message` — but never at the price of the user's
+    /// words: whatever was accumulated is delivered first, THEN the error is shown.
+    /// Discarding minutes of dictation because the stream died was itself a data loss.
+    private func failSession(_ message: String) async {
+        let salvaged = displayText.trimmingCharacters(in: .whitespacesAndNewlines)
+        await teardown()
+        let epoch = sessionEpoch
+        if !salvaged.isEmpty {
+            let handler = onResult
+            await MainActor.run { handler?(salvaged) }
+            guard epoch == sessionEpoch else { return }
+        }
+        setState(.error(message))
+    }
+
     private func teardown() async {
+        // A successor session can start while the awaits below are in flight. Bump the
+        // epoch and detach everything SYNCHRONOUSLY first, so nothing this teardown
+        // still does can touch what the successor sets up.
+        sessionEpoch += 1
         eventTask?.cancel()
         eventTask = nil
         finalizeTimeoutTask?.cancel()
         finalizeTimeoutTask = nil
-        await stopCapture()
-        await client?.close()
+        let oldClient = client
         client = nil
         partial = ""
         committedText = ""
         reconnectAttempts = 0
         pendingChunks.removeAll(keepingCapacity: true)
         pendingChunkIndex = 0
+        await stopCapture()
+        await oldClient?.close()
     }
 
     private func flushPendingChunks(using client: TranscriptionClient) async {
+        // Single-flight: a second caller (live capture vs reconnect drain) returns
+        // immediately — the running loop re-reads `pendingChunks.count` each pass and
+        // picks up anything appended meanwhile. Interleaved loops shared the queue and
+        // index across `await` and double-sent chunks / trapped in removeFirst.
+        guard !flushing else { return }
+        flushing = true
+        defer { flushing = false }
         while pendingChunkIndex < pendingChunks.count {
+            // A reconnect/teardown can swap the client while we're suspended in send:
+            // this loop then belongs to a dead connection — bail and let the new
+            // client's own flush take over (indices are shared, so touching them from
+            // a stale loop corrupts the live one).
+            guard self.client === client else { return }
             let next = pendingChunks[pendingChunkIndex]
             do {
                 try await client.sendChunk(next)
                 pendingChunkIndex += 1
             } catch {
+                guard self.client === client else { return }
                 Diag.conn.error("chunk send failed → reconnecting: \(Diag.describe(error), privacy: .public)")
-                if capturing { await reconnect() }
+                if capturing || isFinalizing { await reconnect() }
                 return
             }
         }
@@ -354,5 +471,10 @@ public actor DictationController {
             pendingChunks.removeFirst(pendingChunkIndex)
             pendingChunkIndex = 0
         }
+    }
+
+    private var isFinalizing: Bool {
+        if case .finalizing = state { return true }
+        return false
     }
 }

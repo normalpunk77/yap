@@ -15,7 +15,7 @@ public extension TranscriptionSocket {
     func sendBinary(_ data: Data) async throws { try await send(data) }
 }
 
-public protocol TranscriptionClient: Sendable {
+public protocol TranscriptionClient: AnyObject, Sendable {
     func sendChunk(_ pcm16: Data) async throws
     func sendCommit() async throws
     func events() -> AsyncStream<TranscriptEvent>

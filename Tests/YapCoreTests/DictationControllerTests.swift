@@ -98,6 +98,44 @@ final class ScriptedClient: TranscriptionClient, @unchecked Sendable {
     func events() -> AsyncStream<TranscriptEvent> { stream }
 }
 
+/// A client whose `sendChunk` blocks until `releaseAll()` — holds a flush loop suspended
+/// mid-send so a test can prove a second flush can't interleave on the same queue state.
+final class GatedChunkClient: TranscriptionClient, @unchecked Sendable {
+    private let q = DispatchQueue(label: "gated.chunks")
+    private let stream: AsyncStream<TranscriptEvent>
+    private let cont: AsyncStream<TranscriptEvent>.Continuation
+    private var pendingSends: [CheckedContinuation<Void, Never>] = []
+    private var gated = true
+    private var _sent: [Data] = []
+    var sent: [Data] { q.sync { _sent } }
+    init() { (stream, cont) = AsyncStream.makeStream() }
+    func sendChunk(_ pcm16: Data) async throws {
+        let wait: Bool = q.sync {
+            if gated { return true }
+            _sent.append(pcm16)
+            return false
+        }
+        guard wait else { return }
+        await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+            q.sync { pendingSends.append(c) }
+        }
+        q.sync { _sent.append(pcm16) }
+    }
+    func releaseAll() {
+        let conts: [CheckedContinuation<Void, Never>] = q.sync {
+            gated = false
+            let pending = pendingSends
+            pendingSends = []
+            return pending
+        }
+        for c in conts { c.resume() }
+    }
+    func sendCommit() async throws {}
+    func close() async {}
+    func primePreviousText(_ text: String) {}
+    func events() -> AsyncStream<TranscriptEvent> { stream }
+}
+
 /// Hands out a fresh `ScriptedClient` per `make()` and keeps them so a test can drive
 /// each connection (used for reconnection tests).
 final class ClientFactory: @unchecked Sendable {
@@ -520,6 +558,189 @@ final class DictationControllerTests: XCTestCase {
         let s = await controller.state
         if case .error = s {} else { XCTFail("expected error after max reconnects, got \(s)") }
         XCTAssertLessThanOrEqual(factory.clients.count, 4)   // initial + at most 3 reconnects
+    }
+
+    func testFatalErrorDeliversAccumulatedTranscriptBeforeError() async throws {
+        // A fatal mid-session error (quota, auth, session limit) must not throw away
+        // what the user already dictated: deliver the accumulated text, THEN error.
+        let capturer = FakeCapturer()
+        let client = ScriptedClient()
+        let controller = DictationController(capturer: capturer, clientFactory: { client }, flushDelaySeconds: 0)
+        let result = ResultBox()
+        await controller.setHandlers(onState: { _ in }, onResult: { t in result.set(t) })
+
+        await controller.toggle()                        // listening
+        client.emit(.committed("two minutes of speech"))
+        try await waitFor { await controller.state == .listening("two minutes of speech") }
+        client.emit(.failed(.quotaExceeded))             // fatal mid-session
+        try await waitFor { result.value != nil }
+
+        XCTAssertEqual(result.value, "two minutes of speech")   // salvaged, not discarded
+        let s = await controller.state
+        if case .error = s {} else { XCTFail("expected error state, got \(s)") }
+    }
+
+    func testConcurrentChunkForwardsSendEachChunkExactlyOnceInOrder() async throws {
+        // Regression: two flush loops interleaving on the actor (reconnect drain vs live
+        // capture) shared pendingChunks/pendingChunkIndex across `await sendChunk` — the
+        // same chunk went out twice and the final compaction could trap in removeFirst.
+        let capturer = FakeCapturer()
+        let client = GatedChunkClient()
+        let controller = DictationController(capturer: capturer, clientFactory: { client }, flushDelaySeconds: 0)
+        await controller.setHandlers(onState: { _ in }, onResult: { _ in })
+        await controller.toggle()
+
+        let first = Task { await capturer.onChunk?(Data([0x01])) }   // suspends in gated send
+        try await Task.sleep(nanoseconds: 30_000_000)
+        let second = Task { await capturer.onChunk?(Data([0x02])) }  // arrives mid-suspension
+        try await Task.sleep(nanoseconds: 30_000_000)
+        client.releaseAll()
+        _ = await first.value
+        _ = await second.value
+        try await waitFor { client.sent.count >= 2 }
+        try await Task.sleep(nanoseconds: 30_000_000)
+
+        XCTAssertEqual(client.sent, [Data([0x01]), Data([0x02])])   // each chunk exactly once
+    }
+
+    func testToggleDuringTrailingCaptureWindowStartsCleanSecondSession() async throws {
+        // Regression: a second tap while finalize() slept in the trailing-capture window
+        // delivered + restarted, but the STALE finalize then resumed and sabotaged the new
+        // session — stopped its mic and sent a Finalize on its client. The next dictation
+        // recorded nothing.
+        let capturer = FakeCapturer()
+        let factory = ClientFactory()
+        let controller = DictationController(
+            capturer: capturer, clientFactory: { factory.make() },
+            trailingCaptureSeconds: 0.25, flushDelaySeconds: 0, finalizeTimeoutSeconds: 1.0)
+        let result = ResultBox()
+        await controller.setHandlers(onState: { _ in }, onResult: { t in result.set(t) })
+
+        await controller.toggle()                                  // session 1 listening
+        factory.clients[0].emit(.committed("first"))
+        try await waitFor { await controller.state == .listening("first") }
+        let finalizing = Task { await controller.toggle() }        // sleeps in trailing window
+        try await Task.sleep(nanoseconds: 60_000_000)              // inside the 250ms window
+        await controller.toggle()                                  // tap again → deliver + restart
+        try await waitFor { await controller.state == .listening("") }
+        await finalizing.value                                     // stale finalize resumes now
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        XCTAssertEqual(result.value, "first")
+        XCTAssertEqual(capturer.startCount, 2)
+        XCTAssertEqual(capturer.stopCount, 1)           // stale finalize must NOT stop mic #2
+        let s = await controller.state
+        XCTAssertEqual(s, .listening(""))               // session 2 healthy and live
+        XCTAssertEqual(factory.clients.count, 2)
+        XCTAssertEqual(factory.clients[1].commits, 0)   // no stray Finalize on its client
+    }
+
+    func testUnsolicitedCommitDuringPreCommitWindowDoesNotDeliverEarly() async throws {
+        // Regression: a provider auto-commit landing between the stop toggle and our
+        // Finalize send delivered immediately — skipping the flush that transcribes the
+        // trailing words. It must accumulate and deliver only after the real commit.
+        let capturer = FlushGateCapturer()
+        let client = ScriptedClient()
+        let controller = DictationController(
+            capturer: capturer, clientFactory: { client },
+            flushDelaySeconds: 1.0, finalizeTimeoutSeconds: 2.0)
+        let result = ResultBox()
+        await controller.setHandlers(onState: { _ in }, onResult: { t in result.set(t) })
+
+        await controller.toggle()                    // listening
+        client.emit(.committed("hello"))
+        try await waitFor { await controller.state == .listening("hello") }
+        let finalizing = Task { await controller.toggle() }   // blocks in the flush gate
+        try await waitFor { capturer.stopCount == 1 }
+        client.emit(.committed("world"))             // auto-commit in the pre-commit window
+        try await Task.sleep(nanoseconds: 60_000_000)
+
+        XCTAssertNil(result.value, "must not deliver before the Finalize commit is sent")
+        XCTAssertEqual(client.commits, 0)
+
+        capturer.releaseFlush()                      // finalize proceeds: sends the commit
+        await finalizing.value
+        try await waitFor { client.commits == 1 }
+        client.emit(.committed("tail"))              // Finalize flush result
+        try await waitFor { result.value != nil }
+        XCTAssertEqual(result.value, "hello world tail")
+    }
+
+    func testSocketDropReconnectHonorsBackoffDelay() async throws {
+        // Regression: reconnect() runs inside the event-loop task it has just cancelled,
+        // so its `Task.sleep` backoff returned IMMEDIATELY (cancelled context) — reconnect
+        // attempts fired back-to-back instead of backing off.
+        let capturer = FakeCapturer()
+        let factory = ClientFactory()
+        let controller = DictationController(capturer: capturer, clientFactory: { factory.make() },
+                                             flushDelaySeconds: 0, reconnectBackoffSeconds: 0.3)
+        await controller.setHandlers(onState: { _ in }, onResult: { _ in })
+        await controller.toggle()
+        factory.clients[0].emit(.failed(.socketClosed))
+        try await Task.sleep(nanoseconds: 100_000_000)     // well inside the 300ms backoff
+        XCTAssertEqual(factory.clients.count, 1, "reconnect must wait out the backoff, not retry instantly")
+        try await waitFor { factory.clients.count == 2 }   // then it does come up
+    }
+
+    func testStopDuringReconnectBackoffCommitsOnNewConnectionAndKeepsTail() async throws {
+        // Regression: stopping while a reconnect was in its backoff hit `client == nil`,
+        // so sendCommit silently "succeeded" and the reconnect bailed on `capturing ==
+        // false` — the Finalize never went out and the tail was lost to the timeout.
+        let capturer = FakeCapturer()
+        let factory = ClientFactory()
+        let controller = DictationController(
+            capturer: capturer, clientFactory: { factory.make() },
+            flushDelaySeconds: 0, finalizeTimeoutSeconds: 2.0, reconnectBackoffSeconds: 0.2)
+        let result = ResultBox()
+        await controller.setHandlers(onState: { _ in }, onResult: { t in result.set(t) })
+
+        await controller.toggle()                          // listening; clients[0]
+        factory.clients[0].emit(.committed("hello"))
+        try await waitFor { await controller.state == .listening("hello") }
+        factory.clients[0].emit(.failed(.socketClosed))    // drop → reconnect, 200ms backoff
+        try await Task.sleep(nanoseconds: 40_000_000)      // inside the gap (client == nil)
+        let finalizing = Task { await controller.toggle() }  // user stops during the gap
+        try await waitFor { factory.clients.count == 2 }      // reconnect still lands
+        try await waitFor { factory.clients[1].commits == 1 } // and sends the deferred Finalize
+        factory.clients[1].emit(.committed("tail"))           // flush result arrives
+        try await waitFor { result.value != nil }
+        await finalizing.value
+        XCTAssertEqual(result.value, "hello tail")
+    }
+
+    func testStaleFinalizeTimerFromDeliveredSessionCannotClipTheNextOne() async throws {
+        // Regression: finalize() resuming AFTER its session was already delivered (socket
+        // dropped during the flush wait) armed a safety timer anyway. That stale timer
+        // then force-finished the NEXT session mid-finalize, clipping its tail.
+        let capturer = FlushGateCapturer()
+        let factory = ClientFactory()
+        let controller = DictationController(
+            capturer: capturer, clientFactory: { factory.make() },
+            flushDelaySeconds: 1.0, finalizeTimeoutSeconds: 0.8)
+        let result = ResultBox()
+        await controller.setHandlers(onState: { _ in }, onResult: { t in result.set(t) })
+
+        await controller.toggle()                          // session 1; clients[0]
+        factory.clients[0].emit(.committed("one"))
+        try await waitFor { await controller.state == .listening("one") }
+        let finalizing = Task { await controller.toggle() }   // blocks in flush gate
+        try await waitFor { capturer.stopCount == 1 }
+        factory.clients[0].emit(.failed(.socketClosed))    // drop during finalize → deliver now
+        try await waitFor { result.value == "one" }
+        capturer.releaseFlush()                            // stale finalize resumes post-delivery
+        await finalizing.value                             // buggy code arms a stale 0.8s timer
+
+        await controller.toggle()                          // session 2 (gate stays released)
+        factory.clients[1].emit(.committed("second"))
+        try await waitFor { await controller.state == .listening("second") }
+        try await Task.sleep(nanoseconds: 300_000_000)     // run into the stale-timer window
+        let secondFinalize = Task { await controller.toggle() }
+        try await Task.sleep(nanoseconds: 600_000_000)     // past the stale fire, before our own
+        factory.clients[1].emit(.committed("tail"))        // session 2's flush result
+        try await waitFor { result.value != nil && result.value != "one" }
+        await secondFinalize.value
+
+        XCTAssertEqual(result.value, "second tail")        // tail kept — not clipped early
     }
 
     func testUnsolicitedCommitAccumulatesAndDoesNotStop() async throws {
