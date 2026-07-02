@@ -8,6 +8,10 @@ struct SettingsView: View {
     // Speech-to-text
     @State private var provider: TranscriptionProvider = AppConfig.provider
     @State private var apiKey: String = APIKeyStore.loadAPIKey(for: AppConfig.provider) ?? ""
+    // True only when the field actually SHOWED the stored key. Clearing-to-remove must
+    // require it: with the Keychain locked at open, the field starts empty even though
+    // a key exists — a save then must not silently delete a key the user never saw.
+    @State private var storedKeyShownInField: Bool = APIKeyStore.loadAPIKey(for: AppConfig.provider) != nil
     @State private var keyterms: String = AppConfig.loadKeytermsRaw()
     @State private var noVerbatim: Bool = AppConfig.noVerbatim
     @State private var language: String = AppConfig.language
@@ -225,6 +229,7 @@ struct SettingsView: View {
                     // Draft-only selection: the real provider changes only after a
                     // successful Save & Verify.
                     apiKey = APIKeyStore.loadAPIKey(for: newValue) ?? ""
+                    storedKeyShownInField = !apiKey.isEmpty
                     status = ""
                     deviceStatus = ""
                 }
@@ -527,8 +532,10 @@ struct SettingsView: View {
             return
         }
         // Clearing the field + Save = remove the stored key. Verification would just
-        // report "Empty key" and leave the secret in the Keychain forever.
-        if key.isEmpty, !selectedProvider.isLocal,
+        // report "Empty key" and leave the secret in the Keychain forever. Only when
+        // the field actually SHOWED the stored key: an empty field caused by a locked
+        // Keychain at open must not delete a key the user never saw.
+        if key.isEmpty, !selectedProvider.isLocal, storedKeyShownInField,
            APIKeyStore.loadAPIKey(for: selectedProvider) != nil {
             status = APIKeyStore.saveAPIKey("", for: selectedProvider)
                 ? "✓ Key removed"

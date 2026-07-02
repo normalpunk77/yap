@@ -279,6 +279,7 @@ final class MicrophoneCapture: NSObject, AudioCapturer, AVCaptureAudioDataOutput
 
     private static func rank(_ device: AudioInputDevice) -> Int {
         if device.isBuiltIn { return 0 }
+        if device.isVirtual { return 3 }   // loopbacks record silence — dead last
         return device.isBluetooth ? 2 : 1
     }
 
@@ -306,11 +307,22 @@ final class MicrophoneCapture: NSObject, AudioCapturer, AVCaptureAudioDataOutput
     }
 
     func stop() async {
-        sessionActive = false
+        // Claim THIS session's continuation synchronously at entry: stop() suspends
+        // below, and a successor start() can legitimately run during that await (the
+        // tap-during-finalize restart). Reading the property after resuming would grab
+        // — and kill — the successor's fresh continuation, silently muting its whole
+        // dictation. The flag flip in the same critical section makes the delegate
+        // no-op immediately.
+        let cont: AsyncStream<Data>.Continuation? = stateLock.withLock {
+            _sessionActive = false
+            let claimed = _chunkContinuation
+            _chunkContinuation = nil
+            return claimed
+        }
         removeObservers()
-        // Stop the session and detach the delegate FIRST — only then release the
-        // continuation. (Releasing it while the delegate was still yielding into it
-        // from outputQueue was an unsynchronized ARC handoff: intermittent crashes.)
+        // Stop the session and detach the delegate BEFORE finishing the continuation.
+        // (Releasing it while the delegate was still yielding into it from outputQueue
+        // was an unsynchronized ARC handoff: intermittent crashes.)
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             sessionQueue.async { [self] in
                 session.stopRunning()
@@ -318,8 +330,6 @@ final class MicrophoneCapture: NSObject, AudioCapturer, AVCaptureAudioDataOutput
                 continuation.resume()
             }
         }
-        let cont = chunkContinuation
-        chunkContinuation = nil
         cont?.finish()
     }
 

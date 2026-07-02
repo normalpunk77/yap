@@ -22,6 +22,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private var dictationActivity: NSObjectProtocol?
     private var dictationSessionPending = false
     private var dictationSessionActive = false
+    // Quit is in flight: suppress modal alerts (they'd hold .terminateLater hostage)
+    // and fire the local-engine stop only once.
+    private var isTerminating = false
+    private var shutdownStopRequested = false
+    // Last shortcut we already alerted about: resumeHotKey fires on every Settings
+    // focus-loss, and re-alerting the SAME conflict each time is spam, not signal.
+    private var lastConflictAlerted: HotKeyShortcut?
     // Persist the Vertex auth across dictations so its OAuth token cache survives. Rebuilding it
     // per dictation (as `makePostProcessor` did) threw the cache away and re-minted a token every
     // time — a JWT sign + token-exchange round trip to Google that dominated the cleanup latency.
@@ -113,11 +120,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             // still captured (its audio isn't recorded yet at the instant of the press).
             trailingCaptureSeconds: 0.25,
             // Safety-net cap on waiting for the provider's post-commit flush before delivering.
-            // The final segment normally arrives on its own (~0.5s) and delivers immediately;
-            // this only bounds the "stopped after a pause, nothing left to flush" case. 1.2s keeps
-            // a ~2x margin over the observed flush while cutting up to ~3s of dead wait that was
-            // delaying both the paste and the LLM cleanup.
-            finalizeTimeoutSeconds: 1.2
+            // The final segment (or the decoded from_finalize ack) normally arrives on its own
+            // (~0.5s) and delivers immediately — since the ack is decoded, this timeout fires
+            // only when the network actually swallowed it. 2.0s keeps real margin for a lossy
+            // link without re-introducing the old ~3s dead wait in the common case.
+            finalizeTimeoutSeconds: 2.0
         )
         self.controller = controller
 
@@ -379,6 +386,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     /// (auth, quota, network, no speech) use a standard alert — same pattern as the
     /// microphone/accessibility prompts. These are rare and need an explicit answer.
     private func presentError(_ message: String) {
+        // Never a modal while quitting: runModal() inside the .terminateLater window
+        // holds the reply hostage until someone clicks OK on an app that is going away.
+        guard !isTerminating else {
+            Diag.app.error("suppressed error alert during termination: \(message, privacy: .public)")
+            return
+        }
         NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
         alert.alertStyle = .warning
@@ -553,7 +566,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         guard let active = activeHotKey else { return }
         // Another app can claim the combo while ours is suspended (Settings open).
         // Failing silently here left dictation with NO working hotkey and no clue why.
-        if !hotKey.register(active) {
+        if hotKey.register(active) {
+            lastConflictAlerted = nil
+        } else if lastConflictAlerted != active {
+            lastConflictAlerted = active
             presentHotKeyConflict(active)
         }
     }
@@ -664,6 +680,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        isTerminating = true
         guard dictationSessionPending || dictationSessionActive ||
               deliveryQueue.hasPendingWork || Paster.hasPendingClipboardRestore else {
             return .terminateNow
@@ -691,8 +708,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             // that window used to wait out the whole deadline with the mic hot and the
             // dictation dropped. Retrying lands the stop the moment startup settles.
             if AppConfig.provider.isLocal {
-                if parakeetController.isRecording {
-                    await parakeetController.toggle()
+                // Fire-and-forget (once): the local stop AWAITS its transcript poll,
+                // which scales with the recording (up to 60 s on a wedged daemon) —
+                // that must not hold the quit past this function's own 10 s deadline.
+                if parakeetController.isRecording, !shutdownStopRequested {
+                    shutdownStopRequested = true
+                    Task { @MainActor [weak self] in await self?.parakeetController.toggle() }
                 }
             } else if case .listening = await controller.state {
                 await controller.toggle()

@@ -308,6 +308,24 @@ final class AudioInputDevicesTests: XCTestCase {
         XCTAssertEqual(uid, "usb")
     }
 
+    func testPrefersRealBluetoothMicOverVirtualLoopbackDevices() {
+        // BlackHole/aggregate devices are "inputs" that record silence. With no real
+        // wired mic, the REAL Bluetooth mic must win over a virtual device — capturing
+        // a loopback would make dictation silently produce nothing.
+        let devices = [
+            AudioInputDevice(id: 1, uid: "blackhole", name: "BlackHole 2ch", isBuiltIn: false, isVirtual: true),
+            AudioInputDevice(id: 2, uid: "airpods", name: "AirPods", isBuiltIn: false, isBluetooth: true)
+        ]
+
+        let uid = AudioInputDevices.preferredDictationInputUID(
+            devices: devices,
+            preferredInputDeviceUID: nil,
+            defaultOutputIsBluetooth: true
+        )
+
+        XCTAssertEqual(uid, "airpods")
+    }
+
     func testUsesBluetoothMicAsLastResortWhenItIsTheOnlyInput() {
         // A Mac with ONLY AirPods available must still dictate (HFP is unavoidable
         // there) — failing with "no input" would brick dictation entirely.

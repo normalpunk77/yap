@@ -10,13 +10,16 @@ struct AudioInputDevice: Identifiable, Hashable {
     let name: String
     let isBuiltIn: Bool
     let isBluetooth: Bool
+    let isVirtual: Bool
 
-    init(id: AudioDeviceID, uid: String, name: String, isBuiltIn: Bool, isBluetooth: Bool = false) {
+    init(id: AudioDeviceID, uid: String, name: String, isBuiltIn: Bool,
+         isBluetooth: Bool = false, isVirtual: Bool = false) {
         self.id = id
         self.uid = uid
         self.name = name
         self.isBuiltIn = isBuiltIn
         self.isBluetooth = isBluetooth
+        self.isVirtual = isVirtual
     }
 }
 
@@ -38,7 +41,9 @@ enum AudioInputDevices {
                 name: name,
                 isBuiltIn: transport == kAudioDeviceTransportTypeBuiltIn,
                 isBluetooth: transport == kAudioDeviceTransportTypeBluetooth
-                    || transport == kAudioDeviceTransportTypeBluetoothLE)
+                    || transport == kAudioDeviceTransportTypeBluetoothLE,
+                isVirtual: transport == kAudioDeviceTransportTypeVirtual
+                    || transport == kAudioDeviceTransportTypeAggregate)
         }
     }
 
@@ -88,12 +93,14 @@ enum AudioInputDevices {
         if let selected, !(defaultOutputIsBluetooth && selected.isBluetooth) {
             return selected.uid
         }
-        // No usable selection: prefer the built-in mic, then any non-Bluetooth input.
-        // A Bluetooth mic is the LAST resort (a Mac whose only input is the AirPods
-        // must still dictate — HFP is unavoidable there, failing would be worse).
+        // No usable selection: built-in mic → real wired input → any REAL input (a
+        // Bluetooth mic beats failing on a Mac whose only input is the AirPods — HFP
+        // is unavoidable there). Virtual/aggregate devices (BlackHole, Teams audio)
+        // are dead last: "capturing" a loopback records silence, not the user.
         let builtIn = devices.first { $0.isBuiltIn }
-        let nonBluetooth = devices.first { !$0.isBluetooth }
-        return (builtIn ?? nonBluetooth ?? devices.first)?.uid
+        let realWired = devices.first { !$0.isBluetooth && !$0.isVirtual }
+        let realAny = devices.first { !$0.isVirtual }
+        return (builtIn ?? realWired ?? realAny ?? devices.first)?.uid
     }
 
     /// Production wrapper for the active dictation input policy.

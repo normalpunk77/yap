@@ -12,6 +12,7 @@ import YapCore
 /// scripts/build-app.sh) to avoid that. The security win (no plaintext on disk) holds either way.
 enum APIKeyStore {
     private static let didMigrateLegacyKeychainKeysFlag = "didMigrateLegacyKeychainKeys"
+    private static let migrateLegacyKeychainAttemptsKey = "migrateLegacyKeychainAttempts"
     private static let didPurgeLegacyPlaintextKeysFlag = "didPurgeLegacyPlaintextKeys"
 
     private static func service(for provider: TranscriptionProvider) -> String {
@@ -66,6 +67,11 @@ enum APIKeyStore {
     static func migrateLegacyKeychainKeys() {
         let defaults = UserDefaults.standard
         guard !defaults.bool(forKey: didMigrateLegacyKeychainKeysFlag) else { return }
+        // Retry a FAILED migration on later launches (locked keychain at login), but
+        // only a few times: a legacy item whose ACL the user denies would otherwise
+        // re-trigger the keychain permission dialog on EVERY launch, forever.
+        let attempts = defaults.integer(forKey: migrateLegacyKeychainAttemptsKey) + 1
+        defaults.set(attempts, forKey: migrateLegacyKeychainAttemptsKey)
         var fullyMigrated = true
         for provider in [TranscriptionProvider.elevenLabs, .deepgram] {
             switch readAPIKey(for: provider) {
@@ -95,7 +101,9 @@ enum APIKeyStore {
                 break
             }
         }
-        if fullyMigrated { defaults.set(true, forKey: didMigrateLegacyKeychainKeysFlag) }
+        if fullyMigrated || attempts >= 3 {
+            defaults.set(true, forKey: didMigrateLegacyKeychainKeysFlag)
+        }
     }
 
     /// One-time hygiene: wipe any plaintext API keys left in UserDefaults by older builds (the

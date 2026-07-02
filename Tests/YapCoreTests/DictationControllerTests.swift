@@ -743,6 +743,33 @@ final class DictationControllerTests: XCTestCase {
         XCTAssertEqual(result.value, "second tail")        // tail kept — not clipped early
     }
 
+    func testEmptyFinalizeAckDoesNotWipeAnOutstandingPartial() async throws {
+        // Regression guard: a partial left over from a DEAD connection (its final never
+        // arrived; its audio was already compacted away, so the new connection can't
+        // re-transcribe it) must survive an empty Finalize ack — wiping it delivered
+        // committedText only and dropped real words.
+        let capturer = FakeCapturer()
+        let factory = ClientFactory()
+        let controller = DictationController(
+            capturer: capturer, clientFactory: { factory.make() },
+            flushDelaySeconds: 0, finalizeTimeoutSeconds: 2.0, reconnectBackoffSeconds: 0)
+        let result = ResultBox()
+        await controller.setHandlers(onState: { _ in }, onResult: { t in result.set(t) })
+
+        await controller.toggle()
+        factory.clients[0].emit(.committed("hello"))
+        factory.clients[0].emit(.partial("world"))
+        try await waitFor { await controller.state == .listening("hello world") }
+        factory.clients[0].emit(.failed(.socketClosed))     // drop: partial survives locally
+        try await waitFor { factory.clients.count == 2 }
+        await controller.toggle()                            // stop; only silence in the gap
+        try await waitFor { factory.clients[1].commits == 1 }
+        factory.clients[1].emit(.committed(""))              // empty Finalize ack
+        try await waitFor { result.value != nil }
+
+        XCTAssertEqual(result.value, "hello world")          // partial kept, not wiped
+    }
+
     func testCaptureFailureSalvagesTranscriptAndSurfacesError() async throws {
         // The mic can die irrecoverably mid-dictation (device unplugged, session can't
         // restart). The controller must not sit in `.listening` on a dead mic: salvage

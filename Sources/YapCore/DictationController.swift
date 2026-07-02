@@ -284,7 +284,13 @@ public actor DictationController {
         case .committed(let text):
             reconnectAttempts = 0
             appendCommitted(text)
-            partial = ""
+            // An EMPTY committed is a pure Finalize/commit ack — it must not wipe a
+            // partial left over from a dead connection (whose final never arrived and
+            // whose audio can't be re-transcribed): that partial is still deliverable
+            // text. A real committed segment replaces its own interim as before.
+            if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                partial = ""
+            }
             if case .finalizing = state {
                 // Deliver only once OUR commit went out: an unsolicited auto-commit landing
                 // in the pre-commit window (stop right after a natural pause) must
